@@ -10,6 +10,7 @@ Dotnet Tests is a VS Code extension for discovering and running .NET tests direc
 - Adds a dedicated Dotnet Tests Activity Bar pane.
 - Runs a selected test method, class, or project.
 - Runs all discovered test projects.
+- Propagates the last run state down to discovered methods when a project or class run emits detailed outcomes.
 - Streams command output into a dedicated output channel.
 - Shows summarized pass/fail counts in the tree message and status bar.
 - Refreshes automatically when C#, project, or runsettings files change.

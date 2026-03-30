@@ -74,6 +74,12 @@ export interface MethodNode extends DotnetTestNodeBase {
 
 export type DotnetTestNode = ProjectNode | ClassNode | MethodNode;
 
+export interface NodeStateUpdate {
+	id: string;
+	state?: RunState;
+	message?: string;
+}
+
 export class DotnetTestStore {
 	private readonly nodes = new Map<string, DotnetTestNode>();
 	private rootIds: string[] = [];
@@ -104,6 +110,32 @@ export class DotnetTestStore {
 		return node.childrenIds
 			.map(id => this.nodes.get(id))
 			.filter((child): child is DotnetTestNode => child !== undefined);
+	}
+
+	getDescendantMethods(node: DotnetTestNode): MethodNode[] {
+		const methods: MethodNode[] = [];
+		const stack: DotnetTestNode[] = [node];
+
+		while (stack.length > 0) {
+			const current = stack.pop();
+			if (!current) {
+				continue;
+			}
+
+			if (current.kind === 'method') {
+				methods.push(current);
+				continue;
+			}
+
+			for (const childId of current.childrenIds) {
+				const child = this.nodes.get(childId);
+				if (child) {
+					stack.push(child);
+				}
+			}
+		}
+
+		return methods;
 	}
 
 	getSummary(): RunSummary | undefined {
@@ -189,6 +221,42 @@ export class DotnetTestStore {
 		node.state = state;
 		node.message = message;
 		this.recalculateAncestors(node.parentId);
+		this.onDidChangeTreeDataEmitter.fire();
+	}
+
+	applyNodeUpdates(updates: readonly NodeStateUpdate[]): void {
+		const parentIds = new Set<string>();
+		let changed = false;
+
+		for (const update of updates) {
+			const node = this.nodes.get(update.id);
+			if (!node) {
+				continue;
+			}
+
+			if (update.state !== undefined) {
+				node.state = update.state;
+			}
+
+			if ('message' in update) {
+				node.message = update.message;
+			}
+
+			if (node.parentId) {
+				parentIds.add(node.parentId);
+			}
+
+			changed = true;
+		}
+
+		if (!changed) {
+			return;
+		}
+
+		for (const parentId of parentIds) {
+			this.recalculateAncestors(parentId);
+		}
+
 		this.onDidChangeTreeDataEmitter.fire();
 	}
 

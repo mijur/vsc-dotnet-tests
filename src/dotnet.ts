@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import * as vscode from 'vscode';
@@ -15,6 +16,7 @@ import {
 
 const TEST_FILE_PATTERN = '**/*.csproj';
 const IGNORED_PATH_SEGMENTS = ['\\bin\\', '\\obj\\', '\\node_modules\\', '/bin/', '/obj/', '/node_modules/'];
+const TRX_LOG_FILE_PREFIX = 'dotnet-tests';
 const TEST_PROJECT_PATTERNS = [
 	/<IsTestProject>\s*true\s*<\/IsTestProject>/i,
 	/Include=["']Microsoft\.NET\.Test\.Sdk["']/i,
@@ -25,14 +27,42 @@ const TEST_PROJECT_PATTERNS = [
 	/Include=["']Microsoft\.Testing\.Extensions\.VSTestBridge["']/i,
 ];
 
+type CompletedRunState = Exclude<RunState, 'idle' | 'queued' | 'running'>;
+
+export interface DetailedTestResult {
+	name: string;
+	fullyQualifiedName?: string;
+	state: CompletedRunState;
+	durationMs?: number;
+}
+
 export interface DotnetCommandResult {
 	exitCode: number;
-	status: RunState;
+	status: CompletedRunState;
 	commandLine: string;
 	stdout: string;
 	stderr: string;
 	summary: RunSummary;
+	testResults: DetailedTestResult[];
 }
+
+interface RunContext {
+	args: string[];
+	resultsDirectory?: string;
+}
+
+interface RunArgumentOptions {
+	resultsDirectory?: string;
+}
+
+export interface RunDotnetTargetOptions {
+	token?: vscode.CancellationToken;
+	onTestResult?: (result: DetailedTestResult) => void;
+}
+
+interface ExecuteDotnetOptions extends RunDotnetTargetOptions {}
+
+type RunDotnetTargetArgument = RunDotnetTargetOptions | vscode.CancellationToken;
 
 export async function discoverWorkspaceTests(output: vscode.OutputChannel): Promise<DiscoveredProject[]> {
 	if (!vscode.workspace.workspaceFolders?.length) {
@@ -56,25 +86,56 @@ export async function discoverWorkspaceTests(output: vscode.OutputChannel): Prom
 export async function runDotnetTarget(
 	node: DotnetTestNode,
 	output: vscode.OutputChannel,
-	token?: vscode.CancellationToken,
+	optionsOrToken: RunDotnetTargetArgument = {},
 ): Promise<DotnetCommandResult> {
-	const args = buildRunArguments(node);
-	const cwd = path.dirname(node.projectPath);
-	const result = await executeDotnet(args, cwd, output, token);
-	const summary = parseRunSummary(result.combined, args.length === 0 ? 'Run' : `Run ${node.label}`);
-	const status = result.exitCode === 0 ? 'passed' : summary.total > 0 || summary.failed > 0 ? 'failed' : 'errored';
+	const options = normalizeRunDotnetTargetOptions(optionsOrToken);
+	const runContext = await createRunContext(node);
+	const streamedTestResults: DetailedTestResult[] = [];
 
-	return {
-		exitCode: result.exitCode,
-		status,
-		commandLine: result.commandLine,
-		stdout: result.stdout,
-		stderr: result.stderr,
-		summary: {
-			...summary,
+	try {
+		const cwd = path.dirname(node.projectPath);
+		const result = await executeDotnet(runContext.args, cwd, output, {
+			token: options.token,
+			onTestResult: testResult => {
+				streamedTestResults.push(testResult);
+				options.onTestResult?.(testResult);
+			},
+		});
+		const summary = parseRunSummary(result.combined, `Run ${node.label}`);
+		const status = determineRunStatus(result.exitCode, summary);
+		const parsedTestResults = await readDetailedTestResults(runContext, result.combined);
+		const testResults = parsedTestResults.length > 0 ? parsedTestResults : streamedTestResults;
+
+		return {
+			exitCode: result.exitCode,
 			status,
-		},
-	};
+			commandLine: result.commandLine,
+			stdout: result.stdout,
+			stderr: result.stderr,
+			summary: {
+				...summary,
+				status,
+			},
+			testResults,
+		};
+	} finally {
+		await cleanupRunContext(runContext);
+	}
+}
+
+function normalizeRunDotnetTargetOptions(argument: RunDotnetTargetArgument): RunDotnetTargetOptions {
+	if (isCancellationToken(argument)) {
+		return { token: argument };
+	}
+
+	return argument;
+}
+
+function isCancellationToken(value: RunDotnetTargetArgument): value is vscode.CancellationToken {
+	return typeof value === 'object'
+		&& value !== null
+		&& 'isCancellationRequested' in value
+		&& 'onCancellationRequested' in value;
 }
 
 async function discoverProject(projectPath: string, output: vscode.OutputChannel): Promise<DiscoveredProject | undefined> {
@@ -198,26 +259,56 @@ function buildListArguments(projectPath: string, runnerMode: RunnerMode): string
 	}
 }
 
-function buildRunArguments(node: DotnetTestNode): string[] {
+async function createRunContext(node: DotnetTestNode): Promise<RunContext> {
+	if (node.runnerMode === 'vstest') {
+		const resultsDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'dotnet-tests-'));
+		return {
+			resultsDirectory,
+			args: buildRunArguments(node, { resultsDirectory }),
+		};
+	}
+
+	return {
+		args: buildRunArguments(node, {}),
+	};
+}
+
+async function cleanupRunContext(runContext: RunContext): Promise<void> {
+	if (!runContext.resultsDirectory) {
+		return;
+	}
+
+	await fs.rm(runContext.resultsDirectory, { recursive: true, force: true });
+}
+
+function buildRunArguments(node: DotnetTestNode, runContext: RunArgumentOptions): string[] {
 	const filter = buildFilter(node);
 
 	switch (node.runnerMode) {
 		case 'mtp': {
-			const args = ['test', '--project', node.projectPath, '--no-ansi', '--no-progress'];
+			const args = ['test', '--project', node.projectPath, '--no-ansi', '--no-progress', '--output', 'Detailed'];
 			if (filter) {
 				args.push('--filter', filter);
 			}
 			return args;
 		}
 		case 'mtp-legacy': {
-			const args = ['test', node.projectPath, '--'];
+			const args = ['test', node.projectPath, '--', '--output', 'Detailed'];
 			if (filter) {
 				args.push('--filter', filter);
 			}
 			return args;
 		}
 		default: {
-			const args = ['test', node.projectPath, '--nologo'];
+			const args = [
+				'test',
+				node.projectPath,
+				'--nologo',
+				'--results-directory',
+				runContext.resultsDirectory ?? path.join(path.dirname(node.projectPath), 'TestResults'),
+				'--logger',
+				`trx;LogFilePrefix=${TRX_LOG_FILE_PREFIX}`,
+			];
 			if (filter) {
 				args.push('--filter', filter);
 			}
@@ -294,7 +385,7 @@ async function executeDotnet(
 	args: string[],
 	cwd: string,
 	output: vscode.OutputChannel,
-	token?: vscode.CancellationToken,
+	options: ExecuteDotnetOptions = {},
 ): Promise<ExecuteResult> {
 	const commandLine = `dotnet ${args.join(' ')}`;
 	output.appendLine(`$ ${commandLine}`);
@@ -304,8 +395,11 @@ async function executeDotnet(
 		let stdout = '';
 		let stderr = '';
 		let cancelled = false;
+		let stdoutBuffer = '';
+		let stderrBuffer = '';
+		const seenDetailedResults = new Set<string>();
 
-		const cancellationSubscription = token?.onCancellationRequested(() => {
+		const cancellationSubscription = options.token?.onCancellationRequested(() => {
 			cancelled = true;
 			child.kill();
 		});
@@ -314,12 +408,14 @@ async function executeDotnet(
 			const text = chunk.toString();
 			stdout += text;
 			output.append(text);
+			stdoutBuffer = processDetailedResultText(stdoutBuffer, text, seenDetailedResults, options.onTestResult);
 		});
 
 		child.stderr.on('data', chunk => {
 			const text = chunk.toString();
 			stderr += text;
 			output.append(text);
+			stderrBuffer = processDetailedResultText(stderrBuffer, text, seenDetailedResults, options.onTestResult);
 		});
 
 		child.on('error', error => {
@@ -339,6 +435,9 @@ async function executeDotnet(
 				return;
 			}
 
+			flushDetailedResultBuffer(stdoutBuffer, seenDetailedResults, options.onTestResult);
+			flushDetailedResultBuffer(stderrBuffer, seenDetailedResults, options.onTestResult);
+
 			resolve({
 				exitCode: code ?? 1,
 				stdout,
@@ -348,6 +447,350 @@ async function executeDotnet(
 			});
 		});
 	});
+}
+
+async function readDetailedTestResults(runContext: RunContext, output: string): Promise<DetailedTestResult[]> {
+	if (runContext.resultsDirectory) {
+		const trxResults = await readTrxResults(runContext.resultsDirectory);
+		if (trxResults.length > 0) {
+			return trxResults;
+		}
+	}
+
+	return parseDetailedResultsFromOutput(output);
+}
+
+async function readTrxResults(resultsDirectory: string): Promise<DetailedTestResult[]> {
+	const trxFiles = await collectFiles(resultsDirectory, filePath => filePath.toLowerCase().endsWith('.trx'));
+	if (trxFiles.length === 0) {
+		return [];
+	}
+
+	const results = await Promise.all(
+		trxFiles.map(async trxFile => parseTrxResultsXml(await fs.readFile(trxFile, 'utf8'))),
+	);
+
+	return results.flat();
+}
+
+async function collectFiles(directory: string, predicate: (filePath: string) => boolean): Promise<string[]> {
+	try {
+		const entries = await fs.readdir(directory, { withFileTypes: true, encoding: 'utf8' });
+		const files: string[] = [];
+		for (const entry of entries) {
+			const entryPath = path.join(directory, entry.name);
+			if (entry.isDirectory()) {
+				files.push(...await collectFiles(entryPath, predicate));
+				continue;
+			}
+
+			if (predicate(entryPath)) {
+				files.push(entryPath);
+			}
+		}
+
+		return files;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+			return [];
+		}
+
+		throw error;
+	}
+}
+
+export function parseDetailedResultsFromOutput(output: string): DetailedTestResult[] {
+	const lines = stripAnsi(output).split(/\r?\n/);
+	const prefixedResults = lines
+		.map(parsePrefixedResultLine)
+		.filter((result): result is DetailedTestResult => result !== undefined);
+
+	if (prefixedResults.length > 0) {
+		return dedupeDetailedResults(prefixedResults);
+	}
+
+	return dedupeDetailedResults(
+		lines
+			.map(parseBracketedResultLine)
+			.filter((result): result is DetailedTestResult => result !== undefined),
+	);
+}
+
+export function parseDetailedResultLine(line: string): DetailedTestResult | undefined {
+	return parsePrefixedResultLine(line) ?? parseBracketedResultLine(line);
+}
+
+export function parseTrxResultsXml(contents: string): DetailedTestResult[] {
+	const testDefinitions = new Map<string, string>();
+	const definitionPattern = /<UnitTest\b[\s\S]*?\bid="([^"]+)"[\s\S]*?<TestMethod\b[^>]*className="([^"]+)"[^>]*name="([^"]+)"[\s\S]*?<\/UnitTest>/g;
+	for (const match of contents.matchAll(definitionPattern)) {
+		const testId = decodeXmlAttribute(match[1]);
+		const className = decodeXmlAttribute(match[2]).split(',')[0]?.trim();
+		const methodName = decodeXmlAttribute(match[3]).trim();
+		if (!testId || !className || !methodName) {
+			continue;
+		}
+
+		testDefinitions.set(testId, `${className}.${methodName}`);
+	}
+
+	const results: DetailedTestResult[] = [];
+	const resultPattern = /<UnitTestResult\b([\s\S]*?)(?:\/>|>[\s\S]*?<\/UnitTestResult>)/g;
+	for (const match of contents.matchAll(resultPattern)) {
+		const attributes = parseXmlAttributes(match[1]);
+		const state = mapTrxOutcome(attributes.outcome);
+		if (!state) {
+			continue;
+		}
+
+		const fullyQualifiedName = attributes.testId ? testDefinitions.get(attributes.testId) : undefined;
+		const fallbackName = decodeXmlAttribute(attributes.testName ?? '').trim();
+		const name = fullyQualifiedName ?? fallbackName;
+		if (!name) {
+			continue;
+		}
+
+		results.push({
+			name,
+			fullyQualifiedName,
+			state,
+			durationMs: parseTrxDuration(attributes.duration),
+		});
+	}
+
+	return results;
+}
+
+function parsePrefixedResultLine(line: string): DetailedTestResult | undefined {
+	const match = line.trim().match(/^(Passed|Failed|Skipped)\s+(.+)$/i);
+	if (!match) {
+		return undefined;
+	}
+
+	const name = extractReportedTestName(match[2]);
+	if (!name) {
+		return undefined;
+	}
+
+	return {
+		name,
+		fullyQualifiedName: name.includes('.') ? stripParameterizedSuffix(name) : undefined,
+		state: normalizeCompletedState(match[1]),
+		durationMs: readInlineDuration(match[2]),
+	};
+}
+
+function parseBracketedResultLine(line: string): DetailedTestResult | undefined {
+	const match = line.trim().match(/^\[[^\]]+\]\s+(.+?)\s+\[(PASS|FAIL|SKIP|SKIPPED)\]\s*$/i);
+	if (!match) {
+		return undefined;
+	}
+
+	const name = extractReportedTestName(match[1]);
+	if (!name) {
+		return undefined;
+	}
+
+	return {
+		name,
+		fullyQualifiedName: name.includes('.') ? stripParameterizedSuffix(name) : undefined,
+		state: normalizeCompletedState(match[2]),
+	};
+}
+
+function extractReportedTestName(text: string): string | undefined {
+	const candidate = text
+		.replace(/\s+\[[\d.]+\s*(?:ms|s)\]\s*$/i, '')
+		.replace(/\s+\([\d.]+\s*(?:ms|s)\)\s*$/i, '')
+		.trim();
+
+	const trailingNameMatch = candidate.match(/[A-Za-z_][\w`<>, +\[\]-]*(?:\.[A-Za-z_][\w`<>, +\[\]-]*)+(?:\([^)]*\))?$/);
+	if (trailingNameMatch) {
+		return trailingNameMatch[0].trim();
+	}
+
+	return looksLikeTestName(stripParameterizedSuffix(candidate)) ? candidate : undefined;
+}
+
+function dedupeDetailedResults(results: DetailedTestResult[]): DetailedTestResult[] {
+	const unique = new Map<string, DetailedTestResult>();
+	for (const result of results) {
+		const key = createDetailedResultKey(result);
+		if (!unique.has(key)) {
+			unique.set(key, result);
+		}
+	}
+
+	return [...unique.values()];
+}
+
+function normalizeReportedName(value: string): string {
+	return stripParameterizedSuffix(value).replace(/\s+/g, ' ').trim();
+}
+
+function createDetailedResultKey(result: DetailedTestResult): string {
+	return `${result.state}:${normalizeReportedName(result.fullyQualifiedName ?? result.name)}:${result.durationMs ?? ''}`;
+}
+
+function processDetailedResultText(
+	buffer: string,
+	text: string,
+	seenDetailedResults: Set<string>,
+	onTestResult?: (result: DetailedTestResult) => void,
+): string {
+	const combined = buffer + text;
+	const lines = combined.split(/\r?\n/);
+	const remainder = lines.pop() ?? '';
+
+	for (const line of lines) {
+		emitDetailedResultLine(line, seenDetailedResults, onTestResult);
+	}
+
+	return remainder;
+}
+
+function flushDetailedResultBuffer(
+	buffer: string,
+	seenDetailedResults: Set<string>,
+	onTestResult?: (result: DetailedTestResult) => void,
+): void {
+	if (!buffer.trim()) {
+		return;
+	}
+
+	emitDetailedResultLine(buffer, seenDetailedResults, onTestResult);
+}
+
+function emitDetailedResultLine(
+	line: string,
+	seenDetailedResults: Set<string>,
+	onTestResult?: (result: DetailedTestResult) => void,
+): void {
+	const result = parseDetailedResultLine(line);
+	if (!result) {
+		return;
+	}
+
+	const key = createDetailedResultKey(result);
+	if (seenDetailedResults.has(key)) {
+		return;
+	}
+
+	seenDetailedResults.add(key);
+	onTestResult?.(result);
+}
+
+function stripParameterizedSuffix(value: string): string {
+	return value
+		.replace(/\s*\([^)]*\)\s*$/, '')
+		.replace(/\s*\[[^\]]+\]\s*$/, '')
+		.trim();
+}
+
+function readInlineDuration(text: string): number | undefined {
+	const match = text.match(/(?:\[|\()([\d.]+)\s*(ms|s)(?:\]|\))\s*$/i);
+	if (!match) {
+		return undefined;
+	}
+
+	const amount = Number(match[1]);
+	if (!Number.isFinite(amount)) {
+		return undefined;
+	}
+
+	return match[2].toLowerCase() === 's' ? amount * 1000 : amount;
+}
+
+function normalizeCompletedState(value: string): CompletedRunState {
+	switch (value.toLowerCase()) {
+		case 'passed':
+		case 'pass':
+			return 'passed';
+		case 'failed':
+		case 'fail':
+			return 'failed';
+		default:
+			return 'skipped';
+	}
+}
+
+function parseXmlAttributes(fragment: string): Record<string, string> {
+	const attributes: Record<string, string> = {};
+	for (const match of fragment.matchAll(/([A-Za-z_:][A-Za-z0-9_.:-]*)="([^"]*)"/g)) {
+		attributes[match[1]] = decodeXmlAttribute(match[2]);
+	}
+
+	return attributes;
+}
+
+function decodeXmlAttribute(value: string): string {
+	return value
+		.replace(/&quot;/g, '"')
+		.replace(/&apos;/g, "'")
+		.replace(/&lt;/g, '<')
+		.replace(/&gt;/g, '>')
+		.replace(/&amp;/g, '&');
+}
+
+function mapTrxOutcome(outcome: string | undefined): CompletedRunState | undefined {
+	if (!outcome) {
+		return undefined;
+	}
+
+	switch (outcome.toLowerCase()) {
+		case 'passed':
+			return 'passed';
+		case 'failed':
+			return 'failed';
+		case 'notexecuted':
+		case 'skipped':
+		case 'pending':
+			return 'skipped';
+		case 'error':
+		case 'timeout':
+		case 'aborted':
+			return 'errored';
+		default:
+			return undefined;
+	}
+}
+
+function parseTrxDuration(duration: string | undefined): number | undefined {
+	if (!duration) {
+		return undefined;
+	}
+
+	const match = duration.match(/^(?:(\d+):)?(\d+):(\d+)(?:\.(\d+))?$/);
+	if (!match) {
+		return undefined;
+	}
+
+	const hours = Number(match[1] ?? 0);
+	const minutes = Number(match[2]);
+	const seconds = Number(match[3]);
+	const fraction = Number(`0.${match[4] ?? '0'}`);
+
+	return ((hours * 60 * 60) + (minutes * 60) + seconds + fraction) * 1000;
+}
+
+function determineRunStatus(exitCode: number, summary: RunSummary): CompletedRunState {
+	if (summary.failed > 0) {
+		return 'failed';
+	}
+
+	if (summary.total > 0 && summary.skipped === summary.total) {
+		return 'skipped';
+	}
+
+	if (exitCode === 0) {
+		return 'passed';
+	}
+
+	if (summary.total > 0 || summary.skipped > 0) {
+		return 'failed';
+	}
+
+	return 'errored';
 }
 
 function parseRunSummary(output: string, label: string): RunSummary {

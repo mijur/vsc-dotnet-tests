@@ -1,6 +1,12 @@
 import * as vscode from 'vscode';
-import { discoverWorkspaceTests, runDotnetTarget } from './dotnet';
-import { DotnetTestStore, type DotnetTestNode, type DotnetTestsSnapshotNode, type RunSummary, type RunState } from './model';
+import {
+	discoverWorkspaceTests,
+	runDotnetTarget as executeDotnetTarget,
+	type DetailedTestResult,
+	type DotnetCommandResult,
+	type RunDotnetTargetOptions,
+} from './dotnet';
+import { DotnetTestStore, type DotnetTestNode, type DotnetTestsSnapshotNode, type MethodNode, type NodeStateUpdate, type RunSummary, type RunState } from './model';
 import { DotnetTestsTreeProvider } from './tree';
 
 export interface DotnetTestsApi {
@@ -194,21 +200,21 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 				run.started(item);
 			}
 
-			this.store.setNodeState(node.id, 'running', undefined);
+			const methodTracker = createLiveMethodRunTracker(
+				this.store.getDescendantMethods(node),
+				node.kind === 'method' && item ? [node.id] : [],
+			);
+			this.resetTargetMethodStates(node, methodTracker.resolver.targetMethods);
 			run.appendOutput(`> ${node.label}\r\n`);
 
 			try {
-				const result = await runDotnetTarget(node, this.output, token);
+				const result = await this.runTrackedTarget(node, methodTracker, run, token);
 				const message = formatNodeSummary(result.summary, result.status);
-				this.store.setNodeState(node.id, result.status, message);
-
-				if (item) {
-					if (result.status === 'passed') {
-						run.passed(item, result.summary.durationMs);
-					} else if (result.status === 'failed') {
-						run.failed(item, new vscode.TestMessage(message), result.summary.durationMs);
-					} else {
-						run.errored(item, new vscode.TestMessage(message), result.summary.durationMs);
+				const appliedDetailedResults = this.applyDetailedResults(node, result, run, message, methodTracker);
+				if (!appliedDetailedResults) {
+					this.store.setNodeState(node.id, result.status, message);
+					if (item) {
+						updateTestRunItem(run, item, result.status, message, result.summary.durationMs);
 					}
 				}
 
@@ -239,6 +245,141 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 
 		aggregate.status = determineSummaryStatus(aggregate);
 		this.store.setSummary(aggregate);
+	}
+
+	private runTrackedTarget(
+		node: DotnetTestNode,
+		tracker: LiveMethodRunTracker,
+		run: vscode.TestRun,
+		token?: vscode.CancellationToken,
+	): Promise<DotnetCommandResult> {
+		const runOptions: RunDotnetTargetOptions = {
+			token,
+			onTestResult: testResult => this.applyLiveMethodResult(tracker, testResult, run),
+		};
+
+		return executeDotnetTarget(
+			node,
+			this.output,
+			runOptions as RunDotnetTargetOptions & vscode.CancellationToken,
+		);
+	}
+
+	private resetTargetMethodStates(node: DotnetTestNode, methods: readonly MethodNode[]): void {
+		const updates: NodeStateUpdate[] = this.collectAncestorIds(methods)
+			.map(id => ({ id, message: undefined }));
+
+		for (const method of methods) {
+			updates.push({
+				id: method.id,
+				state: 'idle',
+				message: undefined,
+			});
+		}
+
+		if (updates.length > 0) {
+			this.store.applyNodeUpdates(updates);
+		}
+
+		this.store.setNodeState(node.id, 'running', undefined);
+	}
+
+	private applyLiveMethodResult(
+		tracker: LiveMethodRunTracker,
+		testResult: DetailedTestResult,
+		run: vscode.TestRun,
+	): void {
+		const methodResult = trackLiveMethodResult(tracker, testResult);
+		if (!methodResult) {
+			return;
+		}
+
+		this.store.applyNodeUpdates([{
+			id: methodResult.method.id,
+			state: methodResult.state,
+			message: methodResult.message,
+		}]);
+
+		const item = this.testItems.get(methodResult.method.id);
+		if (!item) {
+			return;
+		}
+
+		this.ensureMethodItemStarted(tracker, methodResult.method.id, run, item);
+		updateTestRunItem(run, item, methodResult.state, methodResult.message, methodResult.durationMs);
+	}
+
+	private applyDetailedResults(
+		node: DotnetTestNode,
+		result: DotnetCommandResult,
+		run: vscode.TestRun,
+		summaryMessage: string,
+		tracker: LiveMethodRunTracker,
+	): boolean {
+		const methodResults = resolveMethodRunResults(tracker.resolver.targetMethods, result.testResults);
+		if (!methodResults) {
+			return false;
+		}
+
+		const updates: NodeStateUpdate[] = this.collectAncestorIds(methodResults.map(entry => entry.method))
+			.map(id => ({ id, message: undefined }));
+
+		for (const methodResult of methodResults) {
+			updates.push({
+				id: methodResult.method.id,
+				state: methodResult.state,
+				message: methodResult.message,
+			});
+		}
+
+		if (node.kind !== 'method') {
+			updates.push({ id: node.id, message: summaryMessage });
+		}
+
+		this.store.applyNodeUpdates(updates);
+
+		for (const methodResult of methodResults) {
+			const item = this.testItems.get(methodResult.method.id);
+			if (item) {
+				this.ensureMethodItemStarted(tracker, methodResult.method.id, run, item);
+				updateTestRunItem(run, item, methodResult.state, methodResult.message, methodResult.durationMs);
+			}
+		}
+
+		const scopeItem = this.testItems.get(node.id);
+		if (scopeItem && node.kind !== 'method') {
+			updateTestRunItem(run, scopeItem, result.status, summaryMessage, result.summary.durationMs);
+		}
+
+		return true;
+	}
+
+	private ensureMethodItemStarted(
+		tracker: LiveMethodRunTracker,
+		methodId: string,
+		run: vscode.TestRun,
+		item: vscode.TestItem,
+	): void {
+		if (tracker.startedMethodIds.has(methodId)) {
+			return;
+		}
+
+		tracker.startedMethodIds.add(methodId);
+		run.started(item);
+	}
+
+	private collectAncestorIds(methods: readonly MethodNode[]): string[] {
+		const ancestorIds = new Set<string>();
+
+		for (const method of methods) {
+			let currentId = method.parentId;
+			while (currentId) {
+				ancestorIds.add(currentId);
+				currentId = this.store.getNode(currentId)?.parentId;
+			}
+		}
+
+		return [...ancestorIds];
 	}
 
 	private getRequestTargetIds(request: vscode.TestRunRequest): string[] {
@@ -406,6 +547,25 @@ interface ActionPick extends vscode.QuickPickItem {
 	run: () => Promise<void>;
 }
 
+interface MethodRunResult {
+	method: MethodNode;
+	state: RunState;
+	message: string;
+	durationMs?: number;
+}
+
+interface MethodResultResolver {
+	targetMethods: readonly MethodNode[];
+	exactMatches: ReadonlyMap<string, MethodNode>;
+	labelMatches: ReadonlyMap<string, MethodNode[]>;
+}
+
+interface LiveMethodRunTracker {
+	resolver: MethodResultResolver;
+	resultsByMethodId: Map<string, DetailedTestResult[]>;
+	startedMethodIds: Set<string>;
+}
+
 function createAggregateSummary(label: string, nodes: readonly DotnetTestNode[]): RunSummary {
 	return {
 		label,
@@ -450,11 +610,227 @@ function determineSummaryStatus(summary: RunSummary): RunSummary['status'] {
 		return 'failed';
 	}
 
-	if (summary.passed > 0 || summary.skipped > 0) {
+	if (summary.passed > 0) {
 		return 'passed';
 	}
 
+	if (summary.skipped > 0) {
+		return 'skipped';
+	}
+
 	return 'idle';
+}
+
+function resolveMethodRunResults(
+	targetMethods: readonly MethodNode[],
+	testResults: readonly DetailedTestResult[],
+): MethodRunResult[] | undefined {
+	if (targetMethods.length === 0 || testResults.length === 0) {
+		return undefined;
+	}
+
+	const resolver = createMethodResultResolver(targetMethods);
+	const resultsByMethodId = new Map<string, DetailedTestResult[]>();
+	for (const testResult of testResults) {
+		const method = resolveMethodForTestResult(testResult, resolver);
+		if (!method) {
+			continue;
+		}
+
+		const matches = resultsByMethodId.get(method.id) ?? [];
+		matches.push(testResult);
+		resultsByMethodId.set(method.id, matches);
+	}
+
+	if (resultsByMethodId.size === 0) {
+		return undefined;
+	}
+
+	const resolved = targetMethods
+		.map(method => {
+			const matches = resultsByMethodId.get(method.id);
+			return matches ? aggregateMethodRunResult(method, matches) : undefined;
+		})
+		.filter((result): result is MethodRunResult => result !== undefined);
+
+	return resolved.length > 0 ? resolved : undefined;
+}
+
+function createMethodResultResolver(targetMethods: readonly MethodNode[]): MethodResultResolver {
+	const exactMatches = new Map<string, MethodNode>();
+	const labelMatches = new Map<string, MethodNode[]>();
+
+	for (const method of targetMethods) {
+		exactMatches.set(normalizeTestIdentifier(method.fullyQualifiedName ?? method.label), method);
+		const labelKey = normalizeTestIdentifier(method.label);
+		const methods = labelMatches.get(labelKey) ?? [];
+		methods.push(method);
+		labelMatches.set(labelKey, methods);
+	}
+
+	return {
+		targetMethods,
+		exactMatches,
+		labelMatches,
+	};
+}
+
+function createLiveMethodRunTracker(
+	targetMethods: readonly MethodNode[],
+	startedMethodIds: readonly string[],
+): LiveMethodRunTracker {
+	return {
+		resolver: createMethodResultResolver(targetMethods),
+		resultsByMethodId: new Map<string, DetailedTestResult[]>(),
+		startedMethodIds: new Set(startedMethodIds),
+	};
+}
+
+function trackLiveMethodResult(
+	tracker: LiveMethodRunTracker,
+	testResult: DetailedTestResult,
+): MethodRunResult | undefined {
+	const method = resolveMethodForTestResult(testResult, tracker.resolver);
+	if (!method) {
+		return undefined;
+	}
+
+	const matches = tracker.resultsByMethodId.get(method.id) ?? [];
+	matches.push(testResult);
+	tracker.resultsByMethodId.set(method.id, matches);
+
+	return aggregateMethodRunResult(method, matches);
+}
+
+function resolveMethodForTestResult(
+	testResult: DetailedTestResult,
+	resolver: MethodResultResolver,
+): MethodNode | undefined {
+	const { targetMethods, exactMatches, labelMatches } = resolver;
+	const candidates = [testResult.fullyQualifiedName, testResult.name]
+		.filter((value): value is string => Boolean(value))
+		.map(normalizeTestIdentifier);
+
+	for (const candidate of candidates) {
+		const exactMatch = exactMatches.get(candidate);
+		if (exactMatch) {
+			return exactMatch;
+		}
+
+		const suffixMatches = targetMethods.filter(method => {
+			const fullyQualifiedName = normalizeTestIdentifier(method.fullyQualifiedName ?? method.label);
+			return fullyQualifiedName === candidate || fullyQualifiedName.endsWith(`.${candidate}`);
+		});
+		if (suffixMatches.length === 1) {
+			return suffixMatches[0];
+		}
+
+		const labelKey = candidate.includes('.') ? candidate.slice(candidate.lastIndexOf('.') + 1) : candidate;
+		const matchingLabels = labelMatches.get(labelKey);
+		if (matchingLabels?.length === 1) {
+			return matchingLabels[0];
+		}
+	}
+
+	return undefined;
+}
+
+function aggregateMethodRunResult(method: MethodNode, testResults: readonly DetailedTestResult[]): MethodRunResult {
+	const state = aggregateRunStates(testResults.map(testResult => testResult.state));
+	const outcomeCounts = summarizeDetailedResults(testResults);
+	const durationMs = testResults.some(testResult => testResult.durationMs !== undefined)
+		? testResults.reduce((sum, testResult) => sum + (testResult.durationMs ?? 0), 0)
+		: undefined;
+
+	return {
+		method,
+		state,
+		message: outcomeCounts.mixed
+			? `${outcomeCounts.passed} passed, ${outcomeCounts.failed} failed, ${outcomeCounts.skipped} skipped`
+			: formatRunState(state),
+		durationMs,
+	};
+}
+
+function summarizeDetailedResults(testResults: readonly DetailedTestResult[]): { passed: number; failed: number; skipped: number; mixed: boolean } {
+	let passed = 0;
+	let failed = 0;
+	let skipped = 0;
+	const seenStates = new Set<RunState>();
+
+	for (const testResult of testResults) {
+		seenStates.add(testResult.state);
+		switch (testResult.state) {
+			case 'passed':
+				passed += 1;
+				break;
+			case 'failed':
+			case 'errored':
+				failed += 1;
+				break;
+			case 'skipped':
+				skipped += 1;
+				break;
+		}
+	}
+
+	return {
+		passed,
+		failed,
+		skipped,
+		mixed: seenStates.size > 1,
+	};
+}
+
+function aggregateRunStates(states: readonly RunState[]): RunState {
+	if (states.some(state => state === 'errored')) {
+		return 'errored';
+	}
+
+	if (states.some(state => state === 'failed')) {
+		return 'failed';
+	}
+
+	if (states.some(state => state === 'passed')) {
+		return 'passed';
+	}
+
+	if (states.some(state => state === 'skipped')) {
+		return 'skipped';
+	}
+
+	return 'idle';
+}
+
+function normalizeTestIdentifier(value: string): string {
+	return value
+		.trim()
+		.replace(/\s*\([^)]*\)\s*$/, '')
+		.replace(/\s*\[[^\]]+\]\s*$/, '')
+		.replace(/\s+/g, ' ');
+}
+
+function updateTestRunItem(
+	run: vscode.TestRun,
+	item: vscode.TestItem,
+	state: RunState,
+	message: string,
+	durationMs?: number,
+): void {
+	switch (state) {
+		case 'passed':
+			run.passed(item, durationMs);
+			break;
+		case 'failed':
+			run.failed(item, new vscode.TestMessage(message), durationMs);
+			break;
+		case 'skipped':
+			run.skipped(item);
+			break;
+		default:
+			run.errored(item, new vscode.TestMessage(message), durationMs);
+			break;
+	}
 }
 
 function formatNodeSummary(summary: RunSummary, state: RunState): string {
@@ -462,6 +838,21 @@ function formatNodeSummary(summary: RunSummary, state: RunState): string {
 		return `${summary.passed} passed, ${summary.failed} failed, ${summary.skipped} skipped`;
 	}
 
+	switch (state) {
+		case 'passed':
+			return 'Passed';
+		case 'failed':
+			return 'Failed';
+		case 'errored':
+			return 'Errored';
+		case 'skipped':
+			return 'Skipped';
+		default:
+			return 'Completed';
+	}
+}
+
+function formatRunState(state: RunState): string {
 	switch (state) {
 		case 'passed':
 			return 'Passed';
