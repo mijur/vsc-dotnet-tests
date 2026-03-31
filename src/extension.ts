@@ -1,12 +1,17 @@
+import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { parseCSharpTests } from './csharpParser';
+import { readDiscoveryCache, writeDiscoveryCache } from './discoveryCache';
 import {
+	discoverProject,
 	discoverWorkspaceTests,
+	isIgnoredPath,
 	runDotnetTarget as executeDotnetTarget,
 	type DetailedTestResult,
 	type DotnetCommandResult,
 	type RunDotnetTargetOptions,
 } from './dotnet';
-import { DotnetTestStore, type DotnetTestNode, type DotnetTestsSnapshotNode, type MethodNode, type NodeStateUpdate, type RunSummary, type RunState } from './model';
+import { DotnetTestStore, type DiscoveredProject, type DotnetTestNode, type DotnetTestsSnapshotNode, type MethodNode, type NodeStateUpdate, type RunSummary, type RunState } from './model';
 import { DotnetTestsTreeProvider } from './tree';
 
 export interface DotnetTestsApi {
@@ -24,6 +29,10 @@ export function activate(context: vscode.ExtensionContext): DotnetTestsApi {
 
 export function deactivate() {}
 
+const FILE_REFRESH_DELAY_MS = 750;
+const DOCUMENT_REFRESH_DELAY_MS = 150;
+const RECENT_SAVE_TTL_MS = 1000;
+
 class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 	private readonly store = new DotnetTestStore();
 	private readonly treeProvider = new DotnetTestsTreeProvider(this.store);
@@ -36,8 +45,18 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 	private readonly controller = vscode.tests.createTestController('dotnet-tests.controller', 'Dotnet Tests');
 	private readonly testItems = new Map<string, vscode.TestItem>();
 	private readonly disposables: vscode.Disposable[] = [];
+	private readonly projectWatchers = new Map<string, vscode.Disposable>();
+	private readonly projectDocumentRefreshHandles = new Map<string, NodeJS.Timeout>();
+	private readonly projectRefreshHandles = new Map<string, NodeJS.Timeout>();
+	private readonly queuedProjectRefreshes = new Set<string>();
+	private readonly queuedLiveProjectRefreshes = new Set<string>();
+	private readonly liveProjectOverrides = new Map<string, DiscoveredProject>();
+	private readonly recentProjectSaveTimestamps = new Map<string, number>();
+	private discoveredProjects: DiscoveredProject[] = [];
 	private refreshPromise: Promise<void> | undefined;
 	private refreshHandle: NodeJS.Timeout | undefined;
+	private queuedFullRefresh = false;
+	private queuedShowRefreshMessage = false;
 
 	constructor(private readonly context: vscode.ExtensionContext) {
 		this.statusBar.command = 'dotnet-tests.actions';
@@ -67,10 +86,14 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 			vscode.commands.registerCommand('dotnet-tests.showOutput', () => this.output.show(true)),
 			vscode.commands.registerCommand('dotnet-tests.runNode', (argument?: unknown) => this.runNode(argument)),
 			vscode.commands.registerCommand('dotnet-tests.revealInTestExplorer', (argument?: unknown) => this.revealInTestExplorer(argument)),
+			vscode.workspace.onDidChangeTextDocument(event => this.handleTextDocumentChange(event)),
+			vscode.workspace.onDidSaveTextDocument(document => this.handleTextDocumentSave(document)),
+			vscode.workspace.onDidCloseTextDocument(document => this.handleTextDocumentClose(document)),
 			...this.createWatchers(),
 		);
 
 		this.context.subscriptions.push(...this.disposables);
+		this.restoreDiscoveryCache();
 		this.syncPresentation();
 		void this.refresh();
 	}
@@ -78,7 +101,12 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 	dispose(): void {
 		if (this.refreshHandle) {
 			clearTimeout(this.refreshHandle);
+			this.refreshHandle = undefined;
 		}
+
+		this.clearProjectDocumentRefreshHandles();
+		this.clearProjectRefreshHandles();
+		this.disposeProjectWatchers();
 
 		for (const disposable of this.disposables) {
 			disposable.dispose();
@@ -86,12 +114,17 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 	}
 
 	async refresh(showMessage = false): Promise<void> {
+		this.queueFullRefresh(showMessage);
+		return this.ensureRefreshLoop();
+	}
+
+	private ensureRefreshLoop(): Promise<void> {
 		if (this.refreshPromise) {
 			return this.refreshPromise;
 		}
 
 		this.statusBar.text = '$(sync~spin) Dotnet Tests';
-		this.refreshPromise = this.performRefresh(showMessage).finally(() => {
+		this.refreshPromise = this.performQueuedRefreshes().finally(() => {
 			this.refreshPromise = undefined;
 			this.syncPresentation();
 		});
@@ -99,11 +132,36 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 		return this.refreshPromise;
 	}
 
-	private async performRefresh(showMessage: boolean): Promise<void> {
+	private async performQueuedRefreshes(): Promise<void> {
+		while (this.queuedFullRefresh || this.queuedProjectRefreshes.size > 0 || this.queuedLiveProjectRefreshes.size > 0) {
+			if (this.queuedFullRefresh) {
+				const showMessage = this.queuedShowRefreshMessage;
+				this.queuedFullRefresh = false;
+				this.queuedShowRefreshMessage = false;
+				this.queuedProjectRefreshes.clear();
+				this.queuedLiveProjectRefreshes.clear();
+				await this.performFullRefresh(showMessage);
+				continue;
+			}
+
+			const projectPath = this.takeNextQueuedProjectRefresh();
+			if (projectPath) {
+				await this.performProjectRefresh(projectPath);
+				continue;
+			}
+
+			const liveProjectPath = this.takeNextQueuedLiveProjectRefresh();
+			if (liveProjectPath) {
+				await this.performLiveProjectRefresh(liveProjectPath);
+			}
+		}
+	}
+
+	private async performFullRefresh(showMessage: boolean): Promise<void> {
 		const projects = await discoverWorkspaceTests(this.output);
-		this.store.setSnapshot(projects);
-		this.store.setSummary(undefined);
-		this.syncTestItems();
+		this.applyDiscoveredProjects(projects);
+		await this.persistDiscoveryCache(this.discoveredProjects);
+		this.scheduleDirtyDocumentRefreshes();
 
 		if (showMessage) {
 			const message = projects.length === 0
@@ -113,10 +171,197 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 		}
 	}
 
+	private async performProjectRefresh(projectPath: string): Promise<void> {
+		if (!this.discoveredProjects.some(project => project.projectPath === projectPath)) {
+			return;
+		}
+
+		try {
+			const project = await discoverProject(projectPath, this.output);
+			this.applyProjectRefresh(projectPath, project);
+			await this.persistDiscoveryCache(this.discoveredProjects);
+			this.scheduleDirtyDocumentRefreshes(projectPath);
+		} catch (error) {
+			this.output.appendLine(`Failed to refresh project ${projectPath}: ${getErrorMessage(error)}`);
+		}
+	}
+
+	private async performLiveProjectRefresh(projectPath: string): Promise<void> {
+		const project = this.discoveredProjects.find(entry => entry.projectPath === projectPath);
+		if (!project) {
+			return;
+		}
+
+		const fileContents = this.collectProjectDocumentOverrides(projectPath);
+		if (fileContents.size === 0) {
+			this.applyLiveProjectRefresh(projectPath, undefined);
+			return;
+		}
+
+		try {
+			const classes = await parseCSharpTests(projectPath, { fileContents });
+			this.applyLiveProjectRefresh(projectPath, {
+				...project,
+				classes,
+			});
+		} catch (error) {
+			this.output.appendLine(`Failed to refresh edited project ${projectPath}: ${getErrorMessage(error)}`);
+		}
+	}
+
+	private restoreDiscoveryCache(): void {
+		const projects = readDiscoveryCache(this.context.workspaceState);
+		if (!projects || projects.length === 0) {
+			return;
+		}
+
+		this.applyDiscoveredProjects(projects);
+		this.output.appendLine(`Restored cached discovery for ${projects.length} .NET test project${projects.length === 1 ? '' : 's'}.`);
+	}
+
+	private async persistDiscoveryCache(projects: DiscoveredProject[]): Promise<void> {
+		try {
+			await writeDiscoveryCache(this.context.workspaceState, projects);
+		} catch (error) {
+			this.output.appendLine(`Failed to update discovery cache: ${getErrorMessage(error)}`);
+		}
+	}
+
 	private syncTestItems(): void {
 		this.testItems.clear();
 		const roots = this.store.getRoots().map(node => this.createTestItem(node));
 		this.controller.items.replace(roots);
+	}
+
+	private applyDiscoveredProjects(projects: DiscoveredProject[]): void {
+		this.discoveredProjects = [...projects];
+		this.liveProjectOverrides.clear();
+		this.store.setSnapshot(projects);
+		this.store.setSummary(undefined);
+		this.syncProjectWatchers();
+		this.syncTestItems();
+	}
+
+	private applyProjectRefresh(projectPath: string, project: DiscoveredProject | undefined): void {
+		this.discoveredProjects = [
+			...this.discoveredProjects.filter(entry => entry.projectPath !== projectPath),
+			...(project ? [project] : []),
+		];
+		this.liveProjectOverrides.delete(projectPath);
+
+		if (project) {
+			this.store.setProjectSnapshot(project);
+		} else {
+			this.store.removeProject(projectPath);
+		}
+
+		this.store.setSummary(undefined);
+		this.syncProjectWatchers();
+		this.syncTestItems();
+	}
+
+	private applyLiveProjectRefresh(projectPath: string, project: DiscoveredProject | undefined): void {
+		if (project) {
+			this.liveProjectOverrides.set(projectPath, project);
+		} else {
+			this.liveProjectOverrides.delete(projectPath);
+		}
+
+		const displayedProject = this.liveProjectOverrides.get(projectPath)
+			?? this.discoveredProjects.find(entry => entry.projectPath === projectPath);
+
+		if (displayedProject) {
+			this.store.setProjectSnapshot(displayedProject);
+		} else {
+			this.store.removeProject(projectPath);
+		}
+
+		this.store.setSummary(undefined);
+		this.syncTestItems();
+	}
+
+	private handleTextDocumentChange(event: vscode.TextDocumentChangeEvent): void {
+		if (event.contentChanges.length === 0) {
+			return;
+		}
+
+		const projectPath = this.getTrackedProjectPathForDocument(event.document);
+		if (!projectPath) {
+			return;
+		}
+
+		this.scheduleDocumentRefresh(projectPath);
+	}
+
+	private handleTextDocumentSave(document: vscode.TextDocument): void {
+		const projectPath = this.getTrackedProjectPathForDocument(document);
+		if (!projectPath) {
+			return;
+		}
+
+		this.recentProjectSaveTimestamps.set(projectPath, Date.now());
+		this.clearProjectDocumentRefreshHandle(projectPath);
+		this.queuedLiveProjectRefreshes.delete(projectPath);
+		this.queueProjectRefresh(projectPath);
+		void this.ensureRefreshLoop();
+	}
+
+	private handleTextDocumentClose(document: vscode.TextDocument): void {
+		const projectPath = this.getTrackedProjectPathForDocument(document);
+		if (
+			!projectPath
+			|| this.wasProjectSavedRecently(projectPath)
+			|| (!this.liveProjectOverrides.has(projectPath) && !this.projectDocumentRefreshHandles.has(projectPath))
+		) {
+			return;
+		}
+
+		this.scheduleDocumentRefresh(projectPath);
+	}
+
+	private scheduleDirtyDocumentRefreshes(projectPath?: string): void {
+		for (const dirtyProjectPath of this.collectDirtyProjectPaths(projectPath)) {
+			this.queueLiveProjectRefresh(dirtyProjectPath);
+		}
+	}
+
+	private collectDirtyProjectPaths(projectPath?: string): Set<string> {
+		const dirtyProjectPaths = new Set<string>();
+		for (const document of vscode.workspace.textDocuments) {
+			if (!document.isDirty) {
+				continue;
+			}
+
+			const dirtyProjectPath = this.getTrackedProjectPathForDocument(document);
+			if (!dirtyProjectPath) {
+				continue;
+			}
+
+			if (projectPath && dirtyProjectPath !== projectPath) {
+				continue;
+			}
+
+			dirtyProjectPaths.add(dirtyProjectPath);
+		}
+
+		return dirtyProjectPaths;
+	}
+
+	private collectProjectDocumentOverrides(projectPath: string): Map<string, string> {
+		const fileContents = new Map<string, string>();
+		for (const document of vscode.workspace.textDocuments) {
+			if (!document.isDirty) {
+				continue;
+			}
+
+			if (this.getTrackedProjectPathForDocument(document) !== projectPath) {
+				continue;
+			}
+
+			fileContents.set(document.uri.fsPath, document.getText());
+		}
+
+		return fileContents;
 	}
 
 	private createTestItem(node: DotnetTestNode): vscode.TestItem {
@@ -204,13 +449,23 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 				this.store.getDescendantMethods(node),
 				node.kind === 'method' && item ? [node.id] : [],
 			);
-			this.resetTargetMethodStates(node, methodTracker.resolver.targetMethods);
+			this.startTargetRunState(node, methodTracker, run);
 			run.appendOutput(`> ${node.label}\r\n`);
 
 			try {
 				const result = await this.runTrackedTarget(node, methodTracker, run, token);
 				const message = formatNodeSummary(result.summary, result.status);
-				const appliedDetailedResults = this.applyDetailedResults(node, result, run, message, methodTracker);
+				const inheritedMethodCompletion = createInheritedMethodCompletion(result.status);
+				const detailedResultMethodIds = this.applyDetailedResults(node, result, run, message, methodTracker);
+				this.completeUnreportedMethods(
+					methodTracker,
+					collectReportedMethodIds(methodTracker, detailedResultMethodIds),
+					run,
+					inheritedMethodCompletion.state,
+					inheritedMethodCompletion.message,
+				);
+
+				const appliedDetailedResults = detailedResultMethodIds !== undefined;
 				if (!appliedDetailedResults) {
 					this.store.setNodeState(node.id, result.status, message);
 					if (item) {
@@ -222,6 +477,13 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 				updateAggregateSummary(aggregate, result.summary, result.status);
 			} catch (error) {
 				if (token?.isCancellationRequested) {
+					this.completeUnreportedMethods(
+						methodTracker,
+						collectReportedMethodIds(methodTracker),
+						run,
+						'skipped',
+						'Cancelled',
+					);
 					if (item) {
 						run.skipped(item);
 					}
@@ -230,6 +492,13 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 				}
 
 				const message = error instanceof Error ? error.message : String(error);
+				this.completeUnreportedMethods(
+					methodTracker,
+					collectReportedMethodIds(methodTracker),
+					run,
+					'errored',
+					message,
+				);
 				this.store.setNodeState(node.id, 'errored', message);
 
 				if (item) {
@@ -265,23 +534,25 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 		);
 	}
 
-	private resetTargetMethodStates(node: DotnetTestNode, methods: readonly MethodNode[]): void {
-		const updates: NodeStateUpdate[] = this.collectAncestorIds(methods)
-			.map(id => ({ id, message: undefined }));
+	private startTargetRunState(
+		node: DotnetTestNode,
+		tracker: LiveMethodRunTracker,
+		run: vscode.TestRun,
+	): void {
+		const methods = tracker.resolver.targetMethods;
+		if (methods.length === 0) {
+			this.store.setNodeState(node.id, 'running', undefined);
+			return;
+		}
+
+		this.store.setSubtreeState(node.id, 'running', undefined);
 
 		for (const method of methods) {
-			updates.push({
-				id: method.id,
-				state: 'idle',
-				message: undefined,
-			});
+			const item = this.testItems.get(method.id);
+			if (item) {
+				this.ensureMethodItemStarted(tracker, method.id, run, item);
+			}
 		}
-
-		if (updates.length > 0) {
-			this.store.applyNodeUpdates(updates);
-		}
-
-		this.store.setNodeState(node.id, 'running', undefined);
 	}
 
 	private applyLiveMethodResult(
@@ -315,10 +586,10 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 		run: vscode.TestRun,
 		summaryMessage: string,
 		tracker: LiveMethodRunTracker,
-	): boolean {
+	): ReadonlySet<string> | undefined {
 		const methodResults = resolveMethodRunResults(tracker.resolver.targetMethods, result.testResults);
 		if (!methodResults) {
-			return false;
+			return undefined;
 		}
 
 		const updates: NodeStateUpdate[] = this.collectAncestorIds(methodResults.map(entry => entry.method))
@@ -351,7 +622,37 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 			updateTestRunItem(run, scopeItem, result.status, summaryMessage, result.summary.durationMs);
 		}
 
-		return true;
+		return new Set(methodResults.map(methodResult => methodResult.method.id));
+	}
+
+	private completeUnreportedMethods(
+		tracker: LiveMethodRunTracker,
+		reportedMethodIds: ReadonlySet<string>,
+		run: vscode.TestRun,
+		state: Exclude<RunState, 'idle' | 'queued' | 'running'>,
+		message: string,
+	): void {
+		const unresolvedMethods = tracker.resolver.targetMethods
+			.filter(method => !reportedMethodIds.has(method.id));
+		if (unresolvedMethods.length === 0) {
+			return;
+		}
+
+		this.store.applyNodeUpdates(unresolvedMethods.map(method => ({
+			id: method.id,
+			state,
+			message,
+		})));
+
+		for (const method of unresolvedMethods) {
+			const item = this.testItems.get(method.id);
+			if (!item) {
+				continue;
+			}
+
+			this.ensureMethodItemStarted(tracker, method.id, run, item);
+			updateTestRunItem(run, item, state, message);
+		}
 	}
 
 	private ensureMethodItemStarted(
@@ -365,6 +666,7 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 		}
 
 		tracker.startedMethodIds.add(methodId);
+		run.enqueued(item);
 		run.started(item);
 	}
 
@@ -502,8 +804,60 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 				: 'No .NET test projects found. Use Refresh after adding or restoring test projects.';
 	}
 
+	private syncProjectWatchers(): void {
+		const activeProjectPaths = new Set(this.discoveredProjects.map(project => project.projectPath));
+		for (const [projectPath, watcher] of this.projectWatchers) {
+			if (activeProjectPaths.has(projectPath)) {
+				continue;
+			}
+
+			watcher.dispose();
+			this.projectWatchers.delete(projectPath);
+			this.clearProjectDocumentRefreshHandle(projectPath);
+			this.clearProjectRefreshHandle(projectPath);
+			this.queuedLiveProjectRefreshes.delete(projectPath);
+			this.liveProjectOverrides.delete(projectPath);
+			this.queuedProjectRefreshes.delete(projectPath);
+		}
+
+		for (const project of this.discoveredProjects) {
+			if (this.projectWatchers.has(project.projectPath)) {
+				continue;
+			}
+
+			this.projectWatchers.set(project.projectPath, this.createProjectWatcher(project.projectPath));
+		}
+	}
+
+	private createProjectWatcher(projectPath: string): vscode.Disposable {
+		const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.dirname(projectPath), '**/*.cs'));
+		const schedule = (uri: vscode.Uri) => {
+			if (isIgnoredPath(uri.fsPath)) {
+				return;
+			}
+
+			if (this.getOwningProjectPathForFile(uri.fsPath) !== projectPath) {
+				return;
+			}
+
+			this.scheduleProjectRefresh(projectPath);
+		};
+		const scheduleChangedFile = (uri: vscode.Uri) => {
+			if (this.hasOpenFileDocument(uri.fsPath)) {
+				return;
+			}
+
+			schedule(uri);
+		};
+
+		watcher.onDidCreate(schedule);
+		watcher.onDidChange(scheduleChangedFile);
+		watcher.onDidDelete(schedule);
+		return watcher;
+	}
+
 	private createWatchers(): vscode.Disposable[] {
-		const patterns = ['**/*.csproj', '**/*.cs', '**/global.json', '**/Directory.Build.props', '**/*.runsettings'];
+		const patterns = ['**/*.csproj', '**/global.json', '**/Directory.Build.props', '**/*.runsettings'];
 		return patterns.map(pattern => {
 			const watcher = vscode.workspace.createFileSystemWatcher(pattern);
 			const schedule = () => this.scheduleRefresh();
@@ -520,8 +874,180 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 		}
 
 		this.refreshHandle = setTimeout(() => {
-			void this.refresh();
-		}, 750);
+			this.refreshHandle = undefined;
+			this.queueFullRefresh();
+			void this.ensureRefreshLoop();
+		}, FILE_REFRESH_DELAY_MS);
+	}
+
+	private scheduleDocumentRefresh(projectPath: string): void {
+		const existingHandle = this.projectDocumentRefreshHandles.get(projectPath);
+		if (existingHandle) {
+			clearTimeout(existingHandle);
+		}
+
+		const handle = setTimeout(() => {
+			this.projectDocumentRefreshHandles.delete(projectPath);
+			this.queueLiveProjectRefresh(projectPath);
+			void this.ensureRefreshLoop();
+		}, DOCUMENT_REFRESH_DELAY_MS);
+
+		this.projectDocumentRefreshHandles.set(projectPath, handle);
+	}
+
+	private scheduleProjectRefresh(projectPath: string): void {
+		const existingHandle = this.projectRefreshHandles.get(projectPath);
+		if (existingHandle) {
+			clearTimeout(existingHandle);
+		}
+
+		const handle = setTimeout(() => {
+			this.projectRefreshHandles.delete(projectPath);
+			this.queueProjectRefresh(projectPath);
+			void this.ensureRefreshLoop();
+		}, FILE_REFRESH_DELAY_MS);
+
+		this.projectRefreshHandles.set(projectPath, handle);
+	}
+
+	private queueFullRefresh(showMessage = false): void {
+		if (this.refreshHandle) {
+			clearTimeout(this.refreshHandle);
+			this.refreshHandle = undefined;
+		}
+
+		this.clearProjectDocumentRefreshHandles();
+		this.clearProjectRefreshHandles();
+		this.queuedLiveProjectRefreshes.clear();
+		this.queuedProjectRefreshes.clear();
+		this.queuedFullRefresh = true;
+		this.queuedShowRefreshMessage = this.queuedShowRefreshMessage || showMessage;
+	}
+
+	private queueProjectRefresh(projectPath: string): void {
+		if (this.queuedFullRefresh || !this.discoveredProjects.some(project => project.projectPath === projectPath)) {
+			return;
+		}
+
+		this.queuedProjectRefreshes.add(projectPath);
+	}
+
+	private queueLiveProjectRefresh(projectPath: string): void {
+		if (
+			this.queuedFullRefresh
+			|| this.queuedProjectRefreshes.has(projectPath)
+			|| !this.discoveredProjects.some(project => project.projectPath === projectPath)
+		) {
+			return;
+		}
+
+		this.queuedLiveProjectRefreshes.add(projectPath);
+	}
+
+	private takeNextQueuedProjectRefresh(): string | undefined {
+		const next = this.queuedProjectRefreshes.values().next();
+		if (next.done) {
+			return undefined;
+		}
+
+		this.queuedProjectRefreshes.delete(next.value);
+		return next.value;
+	}
+
+	private takeNextQueuedLiveProjectRefresh(): string | undefined {
+		const next = this.queuedLiveProjectRefreshes.values().next();
+		if (next.done) {
+			return undefined;
+		}
+
+		this.queuedLiveProjectRefreshes.delete(next.value);
+		return next.value;
+	}
+
+	private clearProjectDocumentRefreshHandles(): void {
+		for (const projectPath of [...this.projectDocumentRefreshHandles.keys()]) {
+			this.clearProjectDocumentRefreshHandle(projectPath);
+		}
+	}
+
+	private clearProjectDocumentRefreshHandle(projectPath: string): void {
+		const handle = this.projectDocumentRefreshHandles.get(projectPath);
+		if (!handle) {
+			return;
+		}
+
+		clearTimeout(handle);
+		this.projectDocumentRefreshHandles.delete(projectPath);
+	}
+
+	private clearProjectRefreshHandles(): void {
+		for (const projectPath of [...this.projectRefreshHandles.keys()]) {
+			this.clearProjectRefreshHandle(projectPath);
+		}
+	}
+
+	private clearProjectRefreshHandle(projectPath: string): void {
+		const handle = this.projectRefreshHandles.get(projectPath);
+		if (!handle) {
+			return;
+		}
+
+		clearTimeout(handle);
+		this.projectRefreshHandles.delete(projectPath);
+	}
+
+	private disposeProjectWatchers(): void {
+		for (const watcher of this.projectWatchers.values()) {
+			watcher.dispose();
+		}
+
+		this.projectWatchers.clear();
+	}
+
+	private hasOpenFileDocument(filePath: string): boolean {
+		return vscode.workspace.textDocuments.some(document => normalizeFsPath(document.uri.fsPath) === normalizeFsPath(filePath));
+	}
+
+	private getOwningProjectPathForFile(filePath: string): string | undefined {
+		let matchedProjectPath: string | undefined;
+		let matchedDirectoryLength = -1;
+
+		for (const project of this.discoveredProjects) {
+			const projectDirectory = path.dirname(project.projectPath);
+			if (!isPathWithinDirectory(filePath, projectDirectory)) {
+				continue;
+			}
+
+			const directoryLength = normalizeFsPath(projectDirectory).length;
+			if (directoryLength > matchedDirectoryLength) {
+				matchedProjectPath = project.projectPath;
+				matchedDirectoryLength = directoryLength;
+			}
+		}
+
+		return matchedProjectPath;
+	}
+
+	private getTrackedProjectPathForDocument(document: vscode.TextDocument): string | undefined {
+		if (document.uri.scheme !== 'file' || !document.uri.fsPath.toLowerCase().endsWith('.cs')) {
+			return undefined;
+		}
+
+		return this.getOwningProjectPathForFile(document.uri.fsPath);
+	}
+
+	private wasProjectSavedRecently(projectPath: string): boolean {
+		const savedAt = this.recentProjectSaveTimestamps.get(projectPath);
+		if (!savedAt) {
+			return false;
+		}
+
+		if (Date.now() - savedAt <= RECENT_SAVE_TTL_MS) {
+			return true;
+		}
+
+		this.recentProjectSaveTimestamps.delete(projectPath);
+		return false;
 	}
 
 	getSnapshot(): DotnetTestsSnapshotNode[] {
@@ -575,6 +1101,27 @@ function createAggregateSummary(label: string, nodes: readonly DotnetTestNode[])
 		skipped: 0,
 		projectCount: new Set(nodes.map(node => node.projectPath)).size,
 		status: 'idle',
+	};
+}
+
+function collectReportedMethodIds(
+	tracker: LiveMethodRunTracker,
+	detailedResultMethodIds?: ReadonlySet<string>,
+): Set<string> {
+	const reportedMethodIds = new Set<string>(tracker.resultsByMethodId.keys());
+	for (const methodId of detailedResultMethodIds ?? []) {
+		reportedMethodIds.add(methodId);
+	}
+
+	return reportedMethodIds;
+}
+
+function createInheritedMethodCompletion(
+	state: Exclude<RunState, 'idle' | 'queued' | 'running'>,
+): { state: Exclude<RunState, 'idle' | 'queued' | 'running'>; message: string } {
+	return {
+		state,
+		message: formatRunState(state),
 	};
 }
 
@@ -878,4 +1425,22 @@ function formatSummaryTooltip(summary: RunSummary): string {
 
 function isNodeLike(value: unknown): value is DotnetTestNode {
 	return typeof value === 'object' && value !== null && 'id' in value && typeof value.id === 'string';
+}
+
+function isPathWithinDirectory(filePath: string, directoryPath: string): boolean {
+	const normalizedDirectoryPath = normalizeFsPath(directoryPath);
+	const normalizedFilePath = normalizeFsPath(filePath);
+	return normalizedFilePath === normalizedDirectoryPath || normalizedFilePath.startsWith(ensureTrailingSeparator(normalizedDirectoryPath));
+}
+
+function normalizeFsPath(filePath: string): string {
+	return path.normalize(filePath).replace(/[\\/]+$/, '').toLowerCase();
+}
+
+function ensureTrailingSeparator(filePath: string): string {
+	return filePath.endsWith(path.sep) ? filePath : `${filePath}${path.sep}`;
+}
+
+function getErrorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }

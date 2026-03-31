@@ -83,6 +83,43 @@ export async function discoverWorkspaceTests(output: vscode.OutputChannel): Prom
 	return results;
 }
 
+export async function discoverProject(projectPath: string, output: vscode.OutputChannel): Promise<DiscoveredProject | undefined> {
+	const projectText = await fs.readFile(projectPath, 'utf8');
+	if (!looksLikeTestProject(projectText)) {
+		return undefined;
+	}
+
+	const runnerMode = await detectRunnerMode(projectPath, projectText);
+	const label = path.basename(projectPath, path.extname(projectPath));
+
+	try {
+		const args = buildListArguments(projectPath, runnerMode);
+		const result = await executeDotnet(args, path.dirname(projectPath), output);
+		const tests = parseDiscoveredTests(result.combined);
+		let classes = groupTestsIntoClasses(tests);
+		if (classes.length === 0 || tests.every(test => !test.includes('.'))) {
+			const sourceClasses = await parseCSharpTests(projectPath);
+			classes = alignSourceClassesWithListedTests(sourceClasses, tests);
+		}
+
+		return {
+			projectPath,
+			label,
+			runnerMode,
+			classes,
+			warning: classes.length === 0 ? 'No tests discovered' : tests.every(test => !test.includes('.')) ? 'Using C# source fallback for test structure' : undefined,
+		};
+	} catch (error) {
+		return {
+			projectPath,
+			label,
+			runnerMode,
+			classes: [],
+			warning: getErrorMessage(error),
+		};
+	}
+}
+
 export async function runDotnetTarget(
 	node: DotnetTestNode,
 	output: vscode.OutputChannel,
@@ -136,43 +173,6 @@ function isCancellationToken(value: RunDotnetTargetArgument): value is vscode.Ca
 		&& value !== null
 		&& 'isCancellationRequested' in value
 		&& 'onCancellationRequested' in value;
-}
-
-async function discoverProject(projectPath: string, output: vscode.OutputChannel): Promise<DiscoveredProject | undefined> {
-	const projectText = await fs.readFile(projectPath, 'utf8');
-	if (!looksLikeTestProject(projectText)) {
-		return undefined;
-	}
-
-	const runnerMode = await detectRunnerMode(projectPath, projectText);
-	const label = path.basename(projectPath, path.extname(projectPath));
-
-	try {
-		const args = buildListArguments(projectPath, runnerMode);
-		const result = await executeDotnet(args, path.dirname(projectPath), output);
-		const tests = parseDiscoveredTests(result.combined);
-		let classes = groupTestsIntoClasses(tests);
-		if (classes.length === 0 || tests.every(test => !test.includes('.'))) {
-			const sourceClasses = await parseCSharpTests(projectPath);
-			classes = alignSourceClassesWithListedTests(sourceClasses, tests);
-		}
-
-		return {
-			projectPath,
-			label,
-			runnerMode,
-			classes,
-			warning: classes.length === 0 ? 'No tests discovered' : tests.every(test => !test.includes('.')) ? 'Using C# source fallback for test structure' : undefined,
-		};
-	} catch (error) {
-		return {
-			projectPath,
-			label,
-			runnerMode,
-			classes: [],
-			warning: getErrorMessage(error),
-		};
-	}
 }
 
 function looksLikeTestProject(projectText: string): boolean {
@@ -837,7 +837,7 @@ function containsTagValue(text: string, tag: string, value: string): boolean {
 	return expression.test(text);
 }
 
-function isIgnoredPath(filePath: string): boolean {
+export function isIgnoredPath(filePath: string): boolean {
 	return IGNORED_PATH_SEGMENTS.some(segment => filePath.includes(segment));
 }
 

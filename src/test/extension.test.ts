@@ -1,7 +1,13 @@
+import { promises as fs } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import * as assert from 'assert';
 import * as vscode from 'vscode';
+import { parseCSharpTests } from '../csharpParser';
+import { DISCOVERY_CACHE_KEY, readDiscoveryCache, writeDiscoveryCache } from '../discoveryCache';
 import { parseDetailedResultLine, parseDetailedResultsFromOutput, parseTrxResultsXml } from '../dotnet';
 import type { DotnetTestsApi } from '../extension';
+import { DotnetTestStore, type DiscoveredProject, type DotnetTestsSnapshotNode } from '../model';
 
 suite('Extension Test Suite', () => {
 	test('parses a single detailed result line for streaming updates', () => {
@@ -56,6 +62,147 @@ suite('Extension Test Suite', () => {
 				{ name: 'Tests.SampleProject.CalculatorTests.Subtracts_numbers', state: 'failed' },
 			],
 		);
+	});
+
+	test('persists and restores the discovery cache', async () => {
+		const cacheState = createCacheState();
+		const projects: DiscoveredProject[] = [
+			{
+				projectPath: 'c:/repo/tests/Sample.Tests/Sample.Tests.csproj',
+				label: 'Sample.Tests',
+				runnerMode: 'vstest',
+				warning: 'Using C# source fallback for test structure',
+				classes: [
+					{
+						fullyQualifiedName: 'Sample.Tests.CalculatorTests',
+						label: 'CalculatorTests',
+						methods: [
+							{
+								fullyQualifiedName: 'Sample.Tests.CalculatorTests.Adds_numbers',
+								label: 'Adds_numbers',
+							},
+						],
+					},
+				],
+			},
+		];
+
+		await writeDiscoveryCache(cacheState, projects);
+
+		assert.deepStrictEqual(readDiscoveryCache(cacheState), projects);
+	});
+
+	test('ignores invalid discovery cache entries', () => {
+		const cacheState = createCacheState({
+			[DISCOVERY_CACHE_KEY]: {
+				version: 1,
+				projects: [
+					{
+						projectPath: 'c:/repo/tests/Broken.Tests/Broken.Tests.csproj',
+						label: 'Broken.Tests',
+						runnerMode: 'unknown',
+						classes: [],
+					},
+				],
+			},
+		});
+
+		assert.strictEqual(readDiscoveryCache(cacheState), undefined);
+	});
+
+	test('preserves matching method state across full snapshot refreshes', () => {
+		const store = new DotnetTestStore();
+		store.setSnapshot([createProjectSnapshot(['Adds_numbers', 'Subtracts_numbers'])]);
+
+		const addsMethod = findNodeByLabel(store.getSnapshot()[0], 'Adds_numbers');
+		assert.ok(addsMethod, 'Expected Adds_numbers to be present in the initial snapshot.');
+
+		store.setNodeState(addsMethod!.id, 'passed', 'Passed');
+		store.setSnapshot([createProjectSnapshot(['Adds_numbers', 'Multiplies_numbers'])]);
+
+		const refreshedProject = store.getSnapshot()[0];
+		assert.ok(refreshedProject, 'Expected the refreshed project to remain in the snapshot.');
+		assert.strictEqual(findNodeByLabel(refreshedProject, 'Adds_numbers')?.state, 'passed');
+		assert.strictEqual(findNodeByLabel(refreshedProject, 'Multiplies_numbers')?.state, 'idle');
+		assert.strictEqual(findNodeByLabel(refreshedProject, 'Subtracts_numbers'), undefined);
+	});
+
+	test('preserves matching method state across single project refreshes', () => {
+		const store = new DotnetTestStore();
+		store.setSnapshot([createProjectSnapshot(['Adds_numbers', 'Subtracts_numbers'])]);
+
+		const subtractsMethod = findNodeByLabel(store.getSnapshot()[0], 'Subtracts_numbers');
+		assert.ok(subtractsMethod, 'Expected Subtracts_numbers to be present in the initial snapshot.');
+
+		store.setNodeState(subtractsMethod!.id, 'failed', 'Failed');
+		store.setProjectSnapshot(createProjectSnapshot(['Subtracts_numbers', 'Divides_numbers']));
+
+		const refreshedProject = store.getSnapshot()[0];
+		assert.ok(refreshedProject, 'Expected the refreshed project to remain in the snapshot.');
+		assert.strictEqual(findNodeByLabel(refreshedProject, 'Subtracts_numbers')?.state, 'failed');
+		assert.strictEqual(findNodeByLabel(refreshedProject, 'Divides_numbers')?.state, 'idle');
+		assert.strictEqual(findNodeByLabel(refreshedProject, 'Adds_numbers'), undefined);
+	});
+
+	test('updates the whole subtree when a project run starts', () => {
+		const store = new DotnetTestStore();
+		store.setSnapshot([createProjectSnapshot(['Adds_numbers', 'Subtracts_numbers'])]);
+
+		const initialProject = store.getSnapshot()[0];
+		assert.ok(initialProject, 'Expected the project to be present in the initial snapshot.');
+
+		const projectId = initialProject!.id;
+		const addsMethod = findNodeByLabel(initialProject!, 'Adds_numbers');
+		const subtractsMethod = findNodeByLabel(initialProject!, 'Subtracts_numbers');
+		assert.ok(addsMethod, 'Expected Adds_numbers to be present in the initial snapshot.');
+		assert.ok(subtractsMethod, 'Expected Subtracts_numbers to be present in the initial snapshot.');
+
+		store.setNodeState(addsMethod!.id, 'passed', 'Passed');
+		store.setNodeState(subtractsMethod!.id, 'failed', 'Failed');
+		store.setSubtreeState(projectId, 'running');
+
+		const runningProject = store.getSnapshot()[0];
+		assert.ok(runningProject, 'Expected the project to remain in the snapshot.');
+		assert.strictEqual(runningProject?.state, 'running');
+		assert.strictEqual(findNodeByLabel(runningProject!, 'CalculatorTests')?.state, 'running');
+		assert.strictEqual(findNodeByLabel(runningProject!, 'Adds_numbers')?.state, 'running');
+		assert.strictEqual(findNodeByLabel(runningProject!, 'Subtracts_numbers')?.state, 'running');
+	});
+
+	test('parses overridden file contents for live editor updates', async () => {
+		const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'dotnet-tests-source-'));
+		const projectPath = path.join(tempDirectory, 'Sample.Tests.csproj');
+		const filePath = path.join(tempDirectory, 'CalculatorTests.cs');
+
+		try {
+			await fs.writeFile(projectPath, '<Project Sdk="Microsoft.NET.Sdk" />', 'utf8');
+			await fs.writeFile(filePath, [
+				'namespace Sample.Tests;',
+				'public class CalculatorTests',
+				'{',
+				'    [Fact]',
+				'    public void Adds_numbers() {}',
+				'}',
+			].join('\n'), 'utf8');
+
+			const classes = await parseCSharpTests(projectPath, {
+				fileContents: new Map([[filePath, [
+					'namespace Sample.Tests;',
+					'public class CalculatorTests',
+					'{',
+					'    [Fact]',
+					'    public void Subtracts_numbers() {}',
+					'}',
+				].join('\n')]]),
+			});
+
+			assert.deepStrictEqual(
+				classes.flatMap(discoveredClass => discoveredClass.methods.map(method => method.label)),
+				['Subtracts_numbers'],
+			);
+		} finally {
+			await fs.rm(tempDirectory, { recursive: true, force: true });
+		}
 	});
 
 	test('registers the main commands', async () => {
@@ -121,4 +268,54 @@ function collectMethodStates(node: { kind: string; state: string; children: Arra
 	}
 
 	return node.children.flatMap(child => collectMethodStates(child));
+}
+
+function findNodeByLabel(node: DotnetTestsSnapshotNode, label: string): DotnetTestsSnapshotNode | undefined {
+	if (node.label === label) {
+		return node;
+	}
+
+	for (const child of node.children) {
+		const match = findNodeByLabel(child, label);
+		if (match) {
+			return match;
+		}
+	}
+
+	return undefined;
+}
+
+function createProjectSnapshot(methodLabels: string[]): DiscoveredProject {
+	return {
+		projectPath: 'c:/repo/tests/Sample.Tests/Sample.Tests.csproj',
+		label: 'Sample.Tests',
+		runnerMode: 'vstest',
+		classes: [
+			{
+				fullyQualifiedName: 'Sample.Tests.CalculatorTests',
+				label: 'CalculatorTests',
+				methods: methodLabels.map(label => ({
+					fullyQualifiedName: `Sample.Tests.CalculatorTests.${label}`,
+					label,
+				})),
+			},
+		],
+	};
+}
+
+function createCacheState(initialEntries: Record<string, unknown> = {}): {
+	get<T>(key: string): T | undefined;
+	update(key: string, value: unknown): Promise<void>;
+} {
+	const entries = new Map<string, unknown>(Object.entries(initialEntries));
+
+	return {
+		get<T>(key: string): T | undefined {
+			return entries.get(key) as T | undefined;
+		},
+		update(key: string, value: unknown): Promise<void> {
+			entries.set(key, value);
+			return Promise.resolve();
+		},
+	};
 }

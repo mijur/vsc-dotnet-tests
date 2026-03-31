@@ -152,61 +152,28 @@ export class DotnetTestStore {
 	}
 
 	setSnapshot(projects: DiscoveredProject[]): void {
+		const previousNodes = new Map(this.nodes);
 		this.nodes.clear();
 		this.rootIds = [];
 
 		for (const project of [...projects].sort((left, right) => left.label.localeCompare(right.label))) {
-			const projectId = createProjectId(project.projectPath);
-			const projectNode: ProjectNode = {
-				id: projectId,
-				kind: 'project',
-				label: project.label,
-				projectPath: project.projectPath,
-				runnerMode: project.runnerMode,
-				childrenIds: [],
-				state: 'idle',
-				projectUri: vscode.Uri.file(project.projectPath),
-				discoveryMessage: project.warning,
-			};
+			this.insertProject(project, previousNodes);
+		}
 
-			this.nodes.set(projectId, projectNode);
-			this.rootIds.push(projectId);
+		this.sortRootIds();
+		this.onDidChangeTreeDataEmitter.fire();
+	}
 
-			for (const discoveredClass of [...project.classes].sort((left, right) => left.label.localeCompare(right.label))) {
-				const classId = createClassId(project.projectPath, discoveredClass.fullyQualifiedName);
-				const classNode: ClassNode = {
-					id: classId,
-					kind: 'class',
-					label: discoveredClass.label,
-					projectPath: project.projectPath,
-					runnerMode: project.runnerMode,
-					childrenIds: [],
-					state: 'idle',
-					parentId: projectId,
-					fullyQualifiedName: discoveredClass.fullyQualifiedName,
-				};
+	setProjectSnapshot(project: DiscoveredProject): void {
+		const previousNodes = this.takeProjectNodes(project.projectPath);
+		this.insertProject(project, previousNodes);
+		this.sortRootIds();
+		this.onDidChangeTreeDataEmitter.fire();
+	}
 
-				this.nodes.set(classId, classNode);
-				projectNode.childrenIds.push(classId);
-
-				for (const method of [...discoveredClass.methods].sort((left, right) => left.label.localeCompare(right.label))) {
-					const methodId = createMethodId(project.projectPath, method.fullyQualifiedName);
-					const methodNode: MethodNode = {
-						id: methodId,
-						kind: 'method',
-						label: method.label,
-						projectPath: project.projectPath,
-						runnerMode: project.runnerMode,
-						childrenIds: [],
-						state: 'idle',
-						parentId: classId,
-						fullyQualifiedName: method.fullyQualifiedName,
-					};
-
-					this.nodes.set(methodId, methodNode);
-					classNode.childrenIds.push(methodId);
-				}
-			}
+	removeProject(projectPath: string): void {
+		if (this.takeProjectNodes(projectPath).size === 0) {
+			return;
 		}
 
 		this.onDidChangeTreeDataEmitter.fire();
@@ -260,6 +227,33 @@ export class DotnetTestStore {
 		this.onDidChangeTreeDataEmitter.fire();
 	}
 
+	setSubtreeState(id: string, state: RunState, message?: string): void {
+		const root = this.nodes.get(id);
+		if (!root) {
+			return;
+		}
+
+		const stack: DotnetTestNode[] = [root];
+		while (stack.length > 0) {
+			const current = stack.pop();
+			if (!current) {
+				continue;
+			}
+
+			current.state = state;
+			current.message = message;
+			for (const childId of current.childrenIds) {
+				const child = this.nodes.get(childId);
+				if (child) {
+					stack.push(child);
+				}
+			}
+		}
+
+		this.recalculateAncestors(root.parentId);
+		this.onDidChangeTreeDataEmitter.fire();
+	}
+
 	resetRunState(): void {
 		for (const node of this.nodes.values()) {
 			node.state = 'idle';
@@ -267,6 +261,109 @@ export class DotnetTestStore {
 		}
 
 		this.onDidChangeTreeDataEmitter.fire();
+	}
+
+	private insertProject(project: DiscoveredProject, previousNodes: ReadonlyMap<string, DotnetTestNode>): void {
+		const projectId = createProjectId(project.projectPath);
+		const previousProjectNode = previousNodes.get(projectId);
+		const projectNode: ProjectNode = {
+			id: projectId,
+			kind: 'project',
+			label: project.label,
+			projectPath: project.projectPath,
+			runnerMode: project.runnerMode,
+			childrenIds: [],
+			state: previousProjectNode?.state ?? 'idle',
+			projectUri: vscode.Uri.file(project.projectPath),
+			discoveryMessage: project.warning,
+		};
+
+		this.nodes.set(projectId, projectNode);
+		this.rootIds.push(projectId);
+
+		for (const discoveredClass of [...project.classes].sort((left, right) => left.label.localeCompare(right.label))) {
+			const classId = createClassId(project.projectPath, discoveredClass.fullyQualifiedName);
+			const previousClassNode = previousNodes.get(classId);
+			const classNode: ClassNode = {
+				id: classId,
+				kind: 'class',
+				label: discoveredClass.label,
+				projectPath: project.projectPath,
+				runnerMode: project.runnerMode,
+				childrenIds: [],
+				state: previousClassNode?.state ?? 'idle',
+				parentId: projectId,
+				fullyQualifiedName: discoveredClass.fullyQualifiedName,
+			};
+
+			this.nodes.set(classId, classNode);
+			projectNode.childrenIds.push(classId);
+
+			for (const method of [...discoveredClass.methods].sort((left, right) => left.label.localeCompare(right.label))) {
+				const methodId = createMethodId(project.projectPath, method.fullyQualifiedName);
+				const previousMethodNode = previousNodes.get(methodId);
+				const methodNode: MethodNode = {
+					id: methodId,
+					kind: 'method',
+					label: method.label,
+					projectPath: project.projectPath,
+					runnerMode: project.runnerMode,
+					childrenIds: [],
+					state: previousMethodNode?.state ?? 'idle',
+					parentId: classId,
+					fullyQualifiedName: method.fullyQualifiedName,
+					message: previousMethodNode?.message,
+				};
+
+				this.nodes.set(methodId, methodNode);
+				classNode.childrenIds.push(methodId);
+			}
+
+			if (classNode.childrenIds.length > 0) {
+				classNode.state = aggregateStates(classNode.childrenIds.map(childId => this.nodes.get(childId)?.state ?? 'idle'));
+			}
+		}
+
+		if (projectNode.childrenIds.length > 0) {
+			projectNode.state = aggregateStates(projectNode.childrenIds.map(childId => this.nodes.get(childId)?.state ?? 'idle'));
+		}
+	}
+
+	private takeProjectNodes(projectPath: string): Map<string, DotnetTestNode> {
+		const projectId = createProjectId(projectPath);
+		const projectNode = this.nodes.get(projectId);
+		if (!projectNode || projectNode.kind !== 'project') {
+			return new Map();
+		}
+
+		const previousNodes = new Map<string, DotnetTestNode>();
+		const pendingIds = [projectId];
+		while (pendingIds.length > 0) {
+			const currentId = pendingIds.pop();
+			if (!currentId) {
+				continue;
+			}
+
+			const currentNode = this.nodes.get(currentId);
+			if (!currentNode) {
+				continue;
+			}
+
+			previousNodes.set(currentId, currentNode);
+			pendingIds.push(...currentNode.childrenIds);
+			this.nodes.delete(currentId);
+		}
+
+		this.rootIds = this.rootIds.filter(id => id !== projectId);
+		return previousNodes;
+	}
+
+	private sortRootIds(): void {
+		this.rootIds.sort((left, right) => {
+			const leftLabel = this.nodes.get(left)?.label ?? '';
+			const rightLabel = this.nodes.get(right)?.label ?? '';
+			return leftLabel.localeCompare(rightLabel);
+		});
 	}
 
 	private recalculateAncestors(parentId: string | undefined): void {

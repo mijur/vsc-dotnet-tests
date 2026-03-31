@@ -9,13 +9,20 @@ interface ParsedMethod extends DiscoveredMethod {
 	classFullyQualifiedName: string;
 }
 
-export async function parseCSharpTests(projectPath: string): Promise<DiscoveredClass[]> {
+export interface ParseCSharpTestsOptions {
+	fileContents?: ReadonlyMap<string, string>;
+}
+
+export async function parseCSharpTests(projectPath: string, options: ParseCSharpTestsOptions = {}): Promise<DiscoveredClass[]> {
 	const projectDirectory = path.dirname(projectPath);
 	const files = await collectCSharpFiles(projectDirectory);
 	const classes = new Map<string, DiscoveredMethod[]>();
+	const normalizedFileContents = options.fileContents
+		? new Map([...options.fileContents.entries()].map(([filePath, contents]) => [normalizeFilePath(filePath), contents]))
+		: undefined;
 
 	for (const filePath of files) {
-		const contents = await fs.readFile(filePath, 'utf8');
+		const contents = normalizedFileContents?.get(normalizeFilePath(filePath)) ?? await fs.readFile(filePath, 'utf8');
 		for (const parsedMethod of parseMethodsFromSource(contents)) {
 			const methods = classes.get(parsedMethod.classFullyQualifiedName) ?? [];
 			methods.push({
@@ -185,4 +192,8 @@ function countCharacter(value: string, character: string): number {
 
 function stripParameterizedSuffix(value: string): string {
 	return value.replace(/\(.*\)$/, '');
+}
+
+function normalizeFilePath(filePath: string): string {
+	return path.normalize(filePath).toLowerCase();
 }
