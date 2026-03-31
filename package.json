@@ -2,7 +2,7 @@
   "name": "dotnet-tests",
   "publisher": "local",
   "displayName": "Dotnet Tests",
-  "description": "Visualize, run, and summarize .NET tests in VS Code.",
+  "description": "Discover and run .NET tests in VS Code's built-in Testing view.",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.110.0"
@@ -15,33 +15,15 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
-    "viewsContainers": {
-      "activitybar": [
-        {
-          "id": "dotnetTestsContainer",
-          "title": "Dotnet Tests",
-          "icon": "media/beaker.svg"
-        }
-      ]
-    },
-    "views": {
-      "dotnetTestsContainer": [
-        {
-          "id": "dotnetTestsView",
-          "name": "Projects",
-          "contextualTitle": "Dotnet Tests"
-        }
-      ]
-    },
     "commands": [
       {
         "command": "dotnet-tests.actions",
-        "title": "Actions",
+        "title": "Show Actions",
         "category": "Dotnet Tests"
       },
       {
         "command": "dotnet-tests.refresh",
-        "title": "Refresh",
+        "title": "Refresh Discovered Tests",
         "category": "Dotnet Tests"
       },
       {
@@ -56,51 +38,13 @@
       },
       {
         "command": "dotnet-tests.runNode",
-        "title": "Run Selected Item",
+        "title": "Run Test Target",
         "category": "Dotnet Tests"
       },
       {
         "command": "dotnet-tests.revealInTestExplorer",
-        "title": "Reveal in Test Explorer",
+        "title": "Reveal in Testing View",
         "category": "Dotnet Tests"
-      }
-    ],
-    "menus": {
-      "view/title": [
-        {
-          "command": "dotnet-tests.refresh",
-          "when": "view == dotnetTestsView",
-          "group": "navigation@1"
-        },
-        {
-          "command": "dotnet-tests.runAll",
-          "when": "view == dotnetTestsView",
-          "group": "navigation@2"
-        },
-        {
-          "command": "dotnet-tests.actions",
-          "when": "view == dotnetTestsView",
-          "group": "navigation@3"
-        }
-      ],
-      "view/item/context": [
-        {
-          "command": "dotnet-tests.runNode",
-          "when": "view == dotnetTestsView && viewItem == dotnetTestNode",
-          "group": "inline"
-        },
-        {
-          "command": "dotnet-tests.revealInTestExplorer",
-          "when": "view == dotnetTestsView && viewItem == dotnetTestNode",
-          "group": "navigation"
-        }
-      ]
-    },
-    "viewsWelcome": [
-      {
-        "view": "dotnetTestsView",
-        "contents": "No .NET test projects found.\n[Refresh](command:dotnet-tests.refresh)",
-        "when": "view == dotnetTestsView"
       }
     ]
   },

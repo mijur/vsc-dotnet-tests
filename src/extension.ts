@@ -11,8 +11,7 @@ import {
 	type DotnetCommandResult,
 	type RunDotnetTargetOptions,
 } from './dotnet';
-import { DotnetTestStore, type DiscoveredProject, type DotnetTestNode, type DotnetTestsSnapshotNode, type MethodNode, type NodeStateUpdate, type RunSummary, type RunState } from './model';
-import { DotnetTestsTreeProvider } from './tree';
+import { DotnetTestStore, formatRunnerMode, type DiscoveredProject, type DotnetTestNode, type DotnetTestsSnapshotNode, type MethodNode, type NodeStateUpdate, type ProjectNode, type RunSummary, type RunState } from './model';
 
 export interface DotnetTestsApi {
 	refresh(): Promise<void>;
@@ -35,13 +34,7 @@ const RECENT_SAVE_TTL_MS = 1000;
 
 class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 	private readonly store = new DotnetTestStore();
-	private readonly treeProvider = new DotnetTestsTreeProvider(this.store);
-	private readonly treeView = vscode.window.createTreeView('dotnetTestsView', {
-		treeDataProvider: this.treeProvider,
-		showCollapseAll: true,
-	});
 	private readonly output = vscode.window.createOutputChannel('Dotnet Tests');
-	private readonly statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
 	private readonly controller = vscode.tests.createTestController('dotnet-tests.controller', 'Dotnet Tests');
 	private readonly testItems = new Map<string, vscode.TestItem>();
 	private readonly disposables: vscode.Disposable[] = [];
@@ -59,9 +52,6 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 	private queuedShowRefreshMessage = false;
 
 	constructor(private readonly context: vscode.ExtensionContext) {
-		this.statusBar.command = 'dotnet-tests.actions';
-		this.statusBar.show();
-
 		const runProfile = this.controller.createRunProfile('Run', vscode.TestRunProfileKind.Run, (request, token) => {
 			void this.runRequest(request, token);
 		}, true);
@@ -74,12 +64,8 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 
 		this.disposables.push(
 			runProfile,
-			this.treeProvider,
-			this.treeView,
 			this.output,
-			this.statusBar,
 			this.controller,
-			this.store.onDidChange(() => this.syncPresentation()),
 			vscode.commands.registerCommand('dotnet-tests.refresh', () => this.refresh(true)),
 			vscode.commands.registerCommand('dotnet-tests.actions', () => this.showActions()),
 			vscode.commands.registerCommand('dotnet-tests.runAll', () => this.runAll()),
@@ -94,7 +80,6 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 
 		this.context.subscriptions.push(...this.disposables);
 		this.restoreDiscoveryCache();
-		this.syncPresentation();
 		void this.refresh();
 	}
 
@@ -123,10 +108,8 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 			return this.refreshPromise;
 		}
 
-		this.statusBar.text = '$(sync~spin) Dotnet Tests';
 		this.refreshPromise = this.performQueuedRefreshes().finally(() => {
 			this.refreshPromise = undefined;
-			this.syncPresentation();
 		});
 
 		return this.refreshPromise;
@@ -367,7 +350,7 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 	private createTestItem(node: DotnetTestNode): vscode.TestItem {
 		const uri = node.kind === 'project' ? node.projectUri : undefined;
 		const item = this.controller.createTestItem(node.id, node.label, uri);
-		item.description = node.kind === 'project' ? node.runnerMode.toUpperCase() : undefined;
+		item.description = createTestItemDescription(node);
 		this.testItems.set(node.id, item);
 
 		for (const child of this.store.getChildren(node)) {
@@ -388,9 +371,8 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 	}
 
 	private async runNode(argument?: unknown): Promise<void> {
-		const node = this.resolveNode(argument);
+		const node = this.resolveNode(argument) ?? await this.pickNode('Select a .NET test target to run');
 		if (!node) {
-			void vscode.window.showInformationMessage('Select a test project, class, or method first.');
 			return;
 		}
 
@@ -720,14 +702,58 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 			return this.store.getNode(argument.id) ?? argument;
 		}
 
-		return this.treeView.selection[0];
+		return undefined;
+	}
+
+	private async pickNode(placeHolder: string): Promise<DotnetTestNode | undefined> {
+		if (!(await this.ensureProjectsDiscovered())) {
+			return undefined;
+		}
+
+		const pick = await vscode.window.showQuickPick(this.createNodePicks(), {
+			placeHolder,
+			matchOnDescription: true,
+			matchOnDetail: true,
+		});
+
+		return pick?.node;
+	}
+
+	private async ensureProjectsDiscovered(): Promise<boolean> {
+		if (this.store.hasProjects()) {
+			return true;
+		}
+
+		await this.refresh(true);
+		return this.store.hasProjects();
+	}
+
+	private createNodePicks(): NodePick[] {
+		const picks: NodePick[] = [];
+		for (const project of this.store.getRoots()) {
+			this.appendNodePick(project, picks);
+		}
+
+		return picks;
+	}
+
+	private appendNodePick(node: DotnetTestNode, picks: NodePick[]): void {
+		picks.push({
+			label: node.label,
+			description: createNodePickDescription(node, this.store),
+			detail: createNodePickDetail(node),
+			node,
+		});
+
+		for (const child of this.store.getChildren(node)) {
+			this.appendNodePick(child, picks);
+		}
 	}
 
 	private async showActions(): Promise<void> {
-		const selected = this.treeView.selection[0];
 		const picks: ActionPick[] = [
 			{
-				label: 'Refresh test tree',
+				label: 'Refresh discovered tests',
 				detail: 'Re-scan the workspace and rediscover test projects and methods.',
 				run: () => this.refresh(true),
 			},
@@ -737,26 +763,21 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 				run: () => this.runAll(),
 			},
 			{
+				label: 'Run a discovered test target',
+				detail: 'Pick a discovered project, class, or method to run.',
+				run: () => this.runNode(),
+			},
+			{
+				label: 'Reveal a discovered test target',
+				detail: 'Pick a discovered project, class, or method and reveal it in the Testing view.',
+				run: () => this.revealInTestExplorer(),
+			},
+			{
 				label: 'Show output',
 				detail: 'Open the Dotnet Tests output channel.',
 				run: async () => this.output.show(true),
 			},
 		];
-
-		if (selected) {
-			picks.unshift(
-				{
-					label: `Run selected: ${selected.label}`,
-					detail: 'Run the tree item that is currently selected.',
-					run: () => this.runNodes([selected], `Run ${selected.label}`),
-				},
-				{
-					label: `Reveal selected: ${selected.label}`,
-					detail: 'Reveal the selected item in the native Test Explorer.',
-					run: () => this.revealInTestExplorer(selected.id),
-				},
-			);
-		}
 
 		const pick = await vscode.window.showQuickPick(picks, {
 			placeHolder: 'Choose a Dotnet Tests action',
@@ -768,7 +789,7 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 	}
 
 	private async revealInTestExplorer(argument?: unknown): Promise<void> {
-		const node = this.resolveNode(argument);
+		const node = this.resolveNode(argument) ?? await this.pickNode('Select a .NET test target to reveal');
 		if (!node) {
 			return;
 		}
@@ -779,29 +800,6 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 		}
 
 		await vscode.commands.executeCommand('vscode.revealTestInExplorer', item);
-	}
-
-	private syncPresentation(): void {
-		const summary = this.store.getSummary();
-		if (this.refreshPromise) {
-			this.statusBar.text = '$(sync~spin) Dotnet Tests';
-			this.statusBar.tooltip = 'Refreshing .NET tests';
-		} else if (summary) {
-			this.statusBar.text = `$(beaker) ${summary.passed} passed, ${summary.failed} failed`;
-			this.statusBar.tooltip = formatSummaryTooltip(summary);
-		} else if (this.store.hasProjects()) {
-			this.statusBar.text = `$(beaker) Dotnet Tests (${this.store.getRoots().length})`;
-			this.statusBar.tooltip = 'Dotnet Tests';
-		} else {
-			this.statusBar.text = '$(beaker) Dotnet Tests';
-			this.statusBar.tooltip = 'No .NET test projects discovered yet';
-		}
-
-		this.treeView.message = summary
-			? formatSummaryMessage(summary)
-			: this.store.hasProjects()
-				? undefined
-				: 'No .NET test projects found. Use Refresh after adding or restoring test projects.';
 	}
 
 	private syncProjectWatchers(): void {
@@ -1071,6 +1069,10 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 
 interface ActionPick extends vscode.QuickPickItem {
 	run: () => Promise<void>;
+}
+
+interface NodePick extends vscode.QuickPickItem {
+	node: DotnetTestNode;
 }
 
 interface MethodRunResult {
@@ -1414,17 +1416,64 @@ function formatRunState(state: RunState): string {
 	}
 }
 
-function formatSummaryMessage(summary: RunSummary): string {
-	const duration = summary.durationMs ? ` in ${Math.round(summary.durationMs)} ms` : '';
-	return `${summary.passed} passed, ${summary.failed} failed, ${summary.skipped} skipped across ${summary.projectCount} project${summary.projectCount === 1 ? '' : 's'}${duration}.`;
-}
-
-function formatSummaryTooltip(summary: RunSummary): string {
-	return `${summary.label}: ${summary.passed} passed, ${summary.failed} failed, ${summary.skipped} skipped.`;
-}
-
 function isNodeLike(value: unknown): value is DotnetTestNode {
 	return typeof value === 'object' && value !== null && 'id' in value && typeof value.id === 'string';
+}
+
+function createTestItemDescription(node: DotnetTestNode): string | undefined {
+	if (node.kind !== 'project') {
+		return undefined;
+	}
+
+	const parts = [formatRunnerMode(node.runnerMode)];
+	if (node.discoveryMessage) {
+		parts.push(node.discoveryMessage);
+	}
+
+	return parts.join(' · ');
+}
+
+function createNodePickDescription(node: DotnetTestNode, store: DotnetTestStore): string {
+	switch (node.kind) {
+		case 'project':
+			return `project · ${formatRunnerMode(node.runnerMode)}`;
+		case 'class': {
+			const project = getProjectNode(store, node);
+			return project ? `class · ${project.label}` : 'class';
+		}
+		default: {
+			const classNode = node.parentId ? store.getNode(node.parentId) : undefined;
+			const project = getProjectNode(store, node);
+			const parts = ['method'];
+			if (classNode?.kind === 'class') {
+				parts.push(classNode.label);
+			}
+			if (project) {
+				parts.push(project.label);
+			}
+
+			return parts.join(' · ');
+		}
+	}
+}
+
+function createNodePickDetail(node: DotnetTestNode): string {
+	return node.kind === 'project'
+		? node.projectPath
+		: node.fullyQualifiedName ?? node.projectPath;
+}
+
+function getProjectNode(store: DotnetTestStore, node: DotnetTestNode): ProjectNode | undefined {
+	let current: DotnetTestNode | undefined = node;
+	while (current) {
+		if (current.kind === 'project') {
+			return current;
+		}
+
+		current = current.parentId ? store.getNode(current.parentId) : undefined;
+	}
+
+	return undefined;
 }
 
 function isPathWithinDirectory(filePath: string, directoryPath: string): boolean {

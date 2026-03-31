@@ -17,6 +17,7 @@ import {
 const TEST_FILE_PATTERN = '**/*.csproj';
 const IGNORED_PATH_SEGMENTS = ['\\bin\\', '\\obj\\', '\\node_modules\\', '/bin/', '/obj/', '/node_modules/'];
 const TRX_LOG_FILE_PREFIX = 'dotnet-tests';
+const LIVE_TRX_POLL_INTERVAL_MS = 200;
 const TEST_PROJECT_PATTERNS = [
 	/<IsTestProject>\s*true\s*<\/IsTestProject>/i,
 	/Include=["']Microsoft\.NET\.Test\.Sdk["']/i,
@@ -61,6 +62,10 @@ export interface RunDotnetTargetOptions {
 }
 
 interface ExecuteDotnetOptions extends RunDotnetTargetOptions {}
+
+interface DetailedResultMonitor {
+	stop(): Promise<void>;
+}
 
 type RunDotnetTargetArgument = RunDotnetTargetOptions | vscode.CancellationToken;
 
@@ -128,16 +133,26 @@ export async function runDotnetTarget(
 	const options = normalizeRunDotnetTargetOptions(optionsOrToken);
 	const runContext = await createRunContext(node);
 	const streamedTestResults: DetailedTestResult[] = [];
+	const observedLiveResults = new Set<string>();
+	const emitLiveTestResult = (testResult: DetailedTestResult) => {
+		const key = createObservedDetailedResultKey(testResult);
+		if (observedLiveResults.has(key)) {
+			return;
+		}
+
+		observedLiveResults.add(key);
+		streamedTestResults.push(testResult);
+		options.onTestResult?.(testResult);
+	};
+	const resultMonitor = startDetailedResultMonitor(runContext, emitLiveTestResult);
 
 	try {
 		const cwd = path.dirname(node.projectPath);
 		const result = await executeDotnet(runContext.args, cwd, output, {
 			token: options.token,
-			onTestResult: testResult => {
-				streamedTestResults.push(testResult);
-				options.onTestResult?.(testResult);
-			},
+			onTestResult: runContext.resultsDirectory ? undefined : emitLiveTestResult,
 		});
+		await resultMonitor?.stop();
 		const summary = parseRunSummary(result.combined, `Run ${node.label}`);
 		const status = determineRunStatus(result.exitCode, summary);
 		const parsedTestResults = await readDetailedTestResults(runContext, result.combined);
@@ -156,6 +171,7 @@ export async function runDotnetTarget(
 			testResults,
 		};
 	} finally {
+		await resultMonitor?.stop();
 		await cleanupRunContext(runContext);
 	}
 }
@@ -306,6 +322,8 @@ function buildRunArguments(node: DotnetTestNode, runContext: RunArgumentOptions)
 				'--nologo',
 				'--results-directory',
 				runContext.resultsDirectory ?? path.join(path.dirname(node.projectPath), 'TestResults'),
+				'--logger',
+				'console;verbosity=detailed',
 				'--logger',
 				`trx;LogFilePrefix=${TRX_LOG_FILE_PREFIX}`,
 			];
@@ -473,6 +491,50 @@ async function readTrxResults(resultsDirectory: string): Promise<DetailedTestRes
 	return results.flat();
 }
 
+function startDetailedResultMonitor(
+	runContext: RunContext,
+	emitResult: (result: DetailedTestResult) => void,
+): DetailedResultMonitor | undefined {
+	if (!runContext.resultsDirectory) {
+		return undefined;
+	}
+
+	let stopped = false;
+	let activePoll: Promise<void> | undefined;
+	const resultsDirectory = runContext.resultsDirectory;
+	const poll = async () => {
+		const results = await readTrxResults(resultsDirectory);
+		for (const result of results) {
+			emitResult(result);
+		}
+	};
+	const schedulePoll = () => {
+		if (stopped || activePoll) {
+			return;
+		}
+
+		activePoll = poll()
+			.catch(() => undefined)
+			.finally(() => {
+				activePoll = undefined;
+			});
+	};
+
+	schedulePoll();
+	const handle = setInterval(schedulePoll, LIVE_TRX_POLL_INTERVAL_MS);
+
+	return {
+		async stop(): Promise<void> {
+			if (!stopped) {
+				stopped = true;
+				clearInterval(handle);
+			}
+
+			await activePoll;
+		},
+	};
+}
+
 async function collectFiles(directory: string, predicate: (filePath: string) => boolean): Promise<string[]> {
 	try {
 		const entries = await fs.readdir(directory, { withFileTypes: true, encoding: 'utf8' });
@@ -630,6 +692,10 @@ function normalizeReportedName(value: string): string {
 
 function createDetailedResultKey(result: DetailedTestResult): string {
 	return `${result.state}:${normalizeReportedName(result.fullyQualifiedName ?? result.name)}:${result.durationMs ?? ''}`;
+}
+
+function createObservedDetailedResultKey(result: DetailedTestResult): string {
+	return `${result.state}:${normalizeReportedName(result.fullyQualifiedName ?? result.name)}`;
 }
 
 function processDetailedResultText(

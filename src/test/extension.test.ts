@@ -64,6 +64,25 @@ suite('Extension Test Suite', () => {
 		);
 	});
 
+	test('parses partial trx output into per-test results for live updates', () => {
+		const results = parseTrxResultsXml(`<?xml version="1.0" encoding="utf-8"?>
+		<TestRun>
+		  <TestDefinitions>
+		    <UnitTest id="test-1" name="Adds_numbers">
+		      <TestMethod className="Tests.SampleProject.CalculatorTests" name="Adds_numbers" />
+		    </UnitTest>
+		  </TestDefinitions>
+		  <Results>
+		    <UnitTestResult executionId="exec-1" testId="test-1" testName="Adds_numbers" outcome="Passed" duration="00:00:00.0123456" />`);
+
+		assert.deepStrictEqual(
+			results.map(result => ({ name: result.name, state: result.state })),
+			[
+				{ name: 'Tests.SampleProject.CalculatorTests.Adds_numbers', state: 'passed' },
+			],
+		);
+	});
+
 	test('persists and restores the discovery cache', async () => {
 		const cacheState = createCacheState();
 		const projects: DiscoveredProject[] = [
@@ -212,6 +231,7 @@ suite('Extension Test Suite', () => {
 			'dotnet-tests.refresh',
 			'dotnet-tests.runAll',
 			'dotnet-tests.runNode',
+			'dotnet-tests.revealInTestExplorer',
 			'dotnet-tests.showOutput',
 		]) {
 			assert.ok(commands.includes(command), `Expected command ${command} to be registered.`);

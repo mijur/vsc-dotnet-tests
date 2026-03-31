@@ -1,19 +1,28 @@
 # Dotnet Tests
 
-Dotnet Tests is a VS Code extension for discovering and running .NET tests directly from a dedicated Activity Bar view and the native Test Explorer.
+Dotnet Tests is a VS Code extension for discovering and running .NET tests directly in VS Code's built-in Testing view.
 
 ## Current Features
 
 - Recursively discovers `.csproj` test projects in the workspace.
 - Uses `dotnet test --list-tests` to build a nested project, class, and method tree.
-- Mirrors the same hierarchy into VS Code's native Testing API.
-- Adds a dedicated Dotnet Tests Activity Bar pane.
+- Publishes the discovered hierarchy into VS Code's native Testing API.
+- Relies on the built-in Testing pane for browsing and running tests.
 - Runs a selected test method, class, or project.
 - Runs all discovered test projects.
 - Propagates the last run state down to discovered methods when a project or class run emits detailed outcomes.
 - Streams command output into a dedicated output channel.
-- Shows summarized pass/fail counts in the tree message and status bar.
+- Keeps discovery and live editor refresh behavior fully automatic.
 - Refreshes automatically while editing open C# files in detected test projects, and runs authoritative rediscovery when saved project or test configuration files change.
+
+## Commands
+
+- `Dotnet Tests: Show Actions` opens a quick-pick for refresh, run, reveal, and output commands.
+- `Dotnet Tests: Refresh Discovered Tests` forces a full workspace rediscovery.
+- `Dotnet Tests: Run All Tests` runs every discovered .NET test project.
+- `Dotnet Tests: Run Test Target` lets you pick a discovered project, class, or method to run.
+- `Dotnet Tests: Reveal in Testing View` lets you pick a discovered project, class, or method and focus it in the Testing pane.
+- `Dotnet Tests: Show Output` opens the extension output channel.
 
 ## Requirements
 
@@ -38,4 +47,4 @@ Dotnet Tests is a VS Code extension for discovering and running .NET tests direc
 
 ### 0.0.1
 
-- Initial implementation slice for discovery, tree rendering, command execution, and summarized results.
+- Initial implementation slice for discovery, Testing view integration, command execution, and summarized results.
