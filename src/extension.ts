@@ -937,7 +937,7 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 	}
 
 	private createWatchers(): vscode.Disposable[] {
-		const patterns = ['**/*.csproj', '**/global.json', '**/Directory.Build.props', '**/*.runsettings'];
+		const patterns = ['**/*.csproj', '**/*.sln', '**/global.json', '**/Directory.Build.props', '**/*.runsettings'];
 		return patterns.map(pattern => {
 			const watcher = vscode.workspace.createFileSystemWatcher(pattern);
 			const schedule = () => this.scheduleRefresh();

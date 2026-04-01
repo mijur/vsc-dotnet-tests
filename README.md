@@ -6,6 +6,7 @@ Dotnet Tests is a VS Code extension for discovering and running .NET tests direc
 
 - Recursively discovers `.csproj` test projects in the workspace.
 - Uses `dotnet test --list-tests` to build a nested project, class, and method tree.
+- Automatically passes `SolutionDir` from the nearest ancestor `.sln` when a test project lives inside a solution.
 - Publishes the discovered hierarchy into VS Code's native Testing API.
 - Relies on the built-in Testing pane for browsing and running tests.
 - Adds source locations to discovered test classes and methods so VS Code can navigate from test items and result messages back to code.
@@ -36,6 +37,7 @@ You can also use `Go to Test Source` from a discovered test class or method's co
 ## Notes
 
 - Runner mode is detected per project and currently distinguishes between VSTest, native Microsoft Testing Platform (MTP), and legacy MTP bridge usage.
+- Discovery and execution stay project-targeted, but automatically inherit `SolutionDir` from the nearest ancestor `.sln` when one exists in the workspace.
 - Method filters use `FullyQualifiedName` matching. Theory and data-driven tests may run at the method level rather than a single data row.
 - When a test runner does not emit detailed per-test outcomes, the extension falls back to summarized project or node results.
 

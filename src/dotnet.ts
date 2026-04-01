@@ -15,6 +15,7 @@ import {
 } from './model';
 
 const TEST_FILE_PATTERN = '**/*.csproj';
+const SOLUTION_FILE_PATTERN = '**/*.sln';
 const IGNORED_PATH_SEGMENTS = ['\\bin\\', '\\obj\\', '\\node_modules\\', '/bin/', '/obj/', '/node_modules/'];
 const TRX_LOG_FILE_PREFIX = 'dotnet-tests';
 const LIVE_TRX_POLL_INTERVAL_MS = 200;
@@ -55,8 +56,9 @@ interface RunContext {
 	resultsDirectory?: string;
 }
 
-interface RunArgumentOptions {
+export interface RunArgumentOptions {
 	resultsDirectory?: string;
+	solutionDirectory?: string;
 }
 
 export interface RunDotnetTargetOptions {
@@ -72,17 +74,27 @@ interface DetailedResultMonitor {
 
 type RunDotnetTargetArgument = RunDotnetTargetOptions | vscode.CancellationToken;
 
+interface DiscoverProjectOptions {
+	solutionPaths?: readonly string[];
+}
+
 export async function discoverWorkspaceTests(output: vscode.OutputChannel): Promise<DiscoveredProject[]> {
 	if (!vscode.workspace.workspaceFolders?.length) {
 		return [];
 	}
 
-	const candidates = await vscode.workspace.findFiles(TEST_FILE_PATTERN);
+	const [candidates, solutionCandidates] = await Promise.all([
+		vscode.workspace.findFiles(TEST_FILE_PATTERN),
+		vscode.workspace.findFiles(SOLUTION_FILE_PATTERN),
+	]);
 	const projectFiles = candidates.filter(candidate => !isIgnoredPath(candidate.fsPath));
+	const solutionPaths = solutionCandidates
+		.map(candidate => candidate.fsPath)
+		.filter(solutionPath => !isIgnoredPath(solutionPath));
 
 	const results: DiscoveredProject[] = [];
 	for (const projectUri of projectFiles) {
-		const project = await discoverProject(projectUri.fsPath, output);
+		const project = await discoverProject(projectUri.fsPath, output, { solutionPaths });
 		if (project) {
 			results.push(project);
 		}
@@ -90,8 +102,11 @@ export async function discoverWorkspaceTests(output: vscode.OutputChannel): Prom
 
 	return results;
 }
-
-export async function discoverProject(projectPath: string, output: vscode.OutputChannel): Promise<DiscoveredProject | undefined> {
+export async function discoverProject(
+	projectPath: string,
+	output: vscode.OutputChannel,
+	options: DiscoverProjectOptions = {},
+): Promise<DiscoveredProject | undefined> {
 	const projectText = await fs.readFile(projectPath, 'utf8');
 	if (!looksLikeTestProject(projectText)) {
 		return undefined;
@@ -99,9 +114,10 @@ export async function discoverProject(projectPath: string, output: vscode.Output
 
 	const runnerMode = await detectRunnerMode(projectPath, projectText);
 	const label = path.basename(projectPath, path.extname(projectPath));
+	const solutionDirectory = await findNearestSolutionDirectory(projectPath, undefined, options.solutionPaths);
 
 	try {
-		const args = buildListArguments(projectPath, runnerMode);
+		const args = buildListArguments(projectPath, runnerMode, solutionDirectory);
 		const result = await executeDotnet(args, path.dirname(projectPath), output);
 		const tests = parseDiscoveredTests(result.combined);
 		let classes = groupTestsIntoClasses(tests);
@@ -249,59 +265,66 @@ function usesMtpGlobalRunner(globalJson: Record<string, unknown> | undefined): b
 }
 
 async function readNearestGlobalJson(projectPath: string): Promise<Record<string, unknown> | undefined> {
-	const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(projectPath));
-	const rootPath = folder?.uri.fsPath;
-	if (!rootPath) {
+	const globalJsonPath = await findNearestWorkspaceFile(projectPath, fileName => fileName.toLowerCase() === 'global.json');
+	if (!globalJsonPath) {
 		return undefined;
 	}
 
-	let currentPath = path.dirname(projectPath);
-	while (currentPath.startsWith(rootPath)) {
-		const globalJsonPath = path.join(currentPath, 'global.json');
-		try {
-			const fileContents = await fs.readFile(globalJsonPath, 'utf8');
-			return JSON.parse(fileContents) as Record<string, unknown>;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-				return undefined;
-			}
-		}
-
-		const parentPath = path.dirname(currentPath);
-		if (parentPath === currentPath) {
-			break;
-		}
-
-		currentPath = parentPath;
+	try {
+		const fileContents = await fs.readFile(globalJsonPath, 'utf8');
+		return JSON.parse(fileContents) as Record<string, unknown>;
+	} catch {
+		return undefined;
 	}
-
-	return undefined;
 }
 
-function buildListArguments(projectPath: string, runnerMode: RunnerMode): string[] {
+
+export async function findNearestSolutionDirectory(
+	projectPath: string,
+	workspaceRootPath?: string,
+	solutionPaths?: readonly string[],
+): Promise<string | undefined> {
+	if (solutionPaths && solutionPaths.length > 0) {
+		const indexedSolutionDirectory = findNearestSolutionDirectoryFromPaths(projectPath, solutionPaths, workspaceRootPath);
+		if (indexedSolutionDirectory) {
+			return indexedSolutionDirectory;
+		}
+	}
+
+	const solutionPath = await findNearestWorkspaceFile(
+		projectPath,
+		fileName => fileName.toLowerCase().endsWith('.sln'),
+		workspaceRootPath,
+	);
+	return solutionPath ? ensureTrailingPathSeparator(path.dirname(solutionPath)) : undefined;
+}
+
+export function buildListArguments(projectPath: string, runnerMode: RunnerMode, solutionDirectory?: string): string[] {
+	const solutionArguments = buildSolutionArguments(solutionDirectory);
 	switch (runnerMode) {
 		case 'mtp':
-			return ['test', '--project', projectPath, '--list-tests', '--no-ansi', '--no-progress'];
+			return ['test', '--project', projectPath, '--list-tests', '--no-ansi', '--no-progress', ...solutionArguments];
 		case 'mtp-legacy':
-			return ['test', projectPath, '--', '--list-tests'];
+			return insertArgumentsBeforeRunnerSeparator(['test', projectPath, '--', '--list-tests'], solutionArguments);
 		default:
-			return ['test', projectPath, '--list-tests', '--nologo'];
+			return ['test', projectPath, '--list-tests', '--nologo', ...solutionArguments];
 	}
 }
 
 async function createRunContext(node: DotnetTestNode): Promise<RunContext> {
 	const filterArguments = await buildFilterArguments(node);
+	const solutionDirectory = await findNearestSolutionDirectory(node.projectPath);
 
 	if (node.runnerMode === 'vstest') {
 		const resultsDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'dotnet-tests-'));
 		return {
 			resultsDirectory,
-			args: buildRunArguments(node, { resultsDirectory }, filterArguments),
+			args: buildRunArguments(node, { resultsDirectory, solutionDirectory }, filterArguments),
 		};
 	}
 
 	return {
-		args: buildRunArguments(node, {}, filterArguments),
+		args: buildRunArguments(node, { solutionDirectory }, filterArguments),
 	};
 }
 
@@ -313,17 +336,18 @@ async function cleanupRunContext(runContext: RunContext): Promise<void> {
 	await fs.rm(runContext.resultsDirectory, { recursive: true, force: true });
 }
 
-function buildRunArguments(node: DotnetTestNode, runContext: RunArgumentOptions, filterArguments: string[]): string[] {
+export function buildRunArguments(node: DotnetTestNode, runContext: RunArgumentOptions, filterArguments: string[]): string[] {
+	const solutionArguments = buildSolutionArguments(runContext.solutionDirectory);
 	switch (node.runnerMode) {
 		case 'mtp': {
-			const args = ['test', '--project', node.projectPath, '--no-ansi', '--no-progress', '--output', 'Detailed'];
+			const args = ['test', '--project', node.projectPath, '--no-ansi', '--no-progress', '--output', 'Detailed', ...solutionArguments];
 			if (filterArguments.length > 0) {
 				args.push(...filterArguments);
 			}
 			return args;
 		}
 		case 'mtp-legacy': {
-			const args = ['test', node.projectPath, '--', '--output', 'Detailed'];
+			const args = insertArgumentsBeforeRunnerSeparator(['test', node.projectPath, '--', '--output', 'Detailed'], solutionArguments);
 			if (filterArguments.length > 0) {
 				args.push(...filterArguments);
 			}
@@ -340,6 +364,7 @@ function buildRunArguments(node: DotnetTestNode, runContext: RunArgumentOptions,
 				'console;verbosity=detailed',
 				'--logger',
 				`trx;LogFilePrefix=${TRX_LOG_FILE_PREFIX}`,
+				...solutionArguments,
 			];
 			if (filterArguments.length > 0) {
 				args.push(...filterArguments);
@@ -347,6 +372,111 @@ function buildRunArguments(node: DotnetTestNode, runContext: RunArgumentOptions,
 			return args;
 		}
 	}
+}
+
+function buildSolutionArguments(solutionDirectory?: string): string[] {
+	if (!solutionDirectory) {
+		return [];
+	}
+
+	return [`-p:SolutionDir=${solutionDirectory}`];
+}
+
+function insertArgumentsBeforeRunnerSeparator(args: string[], additionalArguments: string[]): string[] {
+	if (additionalArguments.length === 0) {
+		return args;
+	}
+
+	const separatorIndex = args.indexOf('--');
+	if (separatorIndex < 0) {
+		return [...args, ...additionalArguments];
+	}
+
+	return [
+		...args.slice(0, separatorIndex),
+		...additionalArguments,
+		...args.slice(separatorIndex),
+	];
+}
+
+function findNearestSolutionDirectoryFromPaths(
+	projectPath: string,
+	solutionPaths: readonly string[],
+	workspaceRootPath?: string,
+): string | undefined {
+	const projectDirectory = path.dirname(projectPath);
+	const rootPath = workspaceRootPath ?? vscode.workspace.getWorkspaceFolder(vscode.Uri.file(projectPath))?.uri.fsPath;
+	if (!rootPath) {
+		return undefined;
+	}
+
+	const candidateDirectories = solutionPaths
+		.map(solutionPath => path.dirname(solutionPath))
+		.filter(solutionDirectory => isPathWithinRoot(solutionDirectory, rootPath))
+		.filter(solutionDirectory => isPathWithinRoot(projectDirectory, solutionDirectory))
+		.sort((left, right) => {
+			const depthDifference = right.length - left.length;
+			return depthDifference !== 0 ? depthDifference : left.localeCompare(right);
+		});
+
+	const nearestDirectory = candidateDirectories[0];
+	return nearestDirectory ? ensureTrailingPathSeparator(nearestDirectory) : undefined;
+}
+
+async function findNearestWorkspaceFile(
+	projectPath: string,
+	matcher: (fileName: string) => boolean,
+	workspaceRootPath?: string,
+): Promise<string | undefined> {
+	const rootPath = workspaceRootPath ?? vscode.workspace.getWorkspaceFolder(vscode.Uri.file(projectPath))?.uri.fsPath;
+	if (!rootPath) {
+		return undefined;
+	}
+
+	let currentPath = path.dirname(projectPath);
+	while (isPathWithinRoot(currentPath, rootPath)) {
+		const match = await findMatchingFileInDirectory(currentPath, matcher);
+		if (match) {
+			return match;
+		}
+
+		const parentPath = path.dirname(currentPath);
+		if (parentPath === currentPath) {
+			break;
+		}
+
+		currentPath = parentPath;
+	}
+
+	return undefined;
+}
+
+async function findMatchingFileInDirectory(
+	directoryPath: string,
+	matcher: (fileName: string) => boolean,
+): Promise<string | undefined> {
+	try {
+		const entries = await fs.readdir(directoryPath, { withFileTypes: true });
+		return entries
+			.filter(entry => entry.isFile() && matcher(entry.name))
+			.map(entry => path.join(directoryPath, entry.name))
+			.sort((left, right) => left.localeCompare(right))[0];
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+			return undefined;
+		}
+
+		throw error;
+	}
+}
+
+function isPathWithinRoot(targetPath: string, rootPath: string): boolean {
+	const relativePath = path.relative(rootPath, targetPath);
+	return relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath));
+}
+
+function ensureTrailingPathSeparator(directoryPath: string): string {
+	return directoryPath.endsWith(path.sep) ? directoryPath : `${directoryPath}${path.sep}`;
 }
 
 async function buildFilterArguments(node: DotnetTestNode): Promise<string[]> {

@@ -5,9 +5,16 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import { mergeSourceLocationsIntoListedClasses, parseCSharpTests } from '../csharpParser';
 import { DISCOVERY_CACHE_KEY, readDiscoveryCache, writeDiscoveryCache } from '../discoveryCache';
-import { parseDetailedResultLine, parseDetailedResultsFromOutput, parseTrxResultsXml } from '../dotnet';
+import {
+	buildListArguments,
+	buildRunArguments,
+	findNearestSolutionDirectory,
+	parseDetailedResultLine,
+	parseDetailedResultsFromOutput,
+	parseTrxResultsXml,
+} from '../dotnet';
 import { createUnreportedMethodCompletion, type DotnetTestsApi } from '../extension';
-import { DotnetTestStore, type DiscoveredProject, type DotnetTestsSnapshotNode } from '../model';
+import { DotnetTestStore, type DiscoveredProject, type DotnetTestNode, type DotnetTestsSnapshotNode } from '../model';
 
 suite('Extension Test Suite', () => {
 	test('parses a single detailed result line for streaming updates', () => {
@@ -153,6 +160,112 @@ suite('Extension Test Suite', () => {
 		await writeDiscoveryCache(cacheState, projects);
 
 		assert.deepStrictEqual(readDiscoveryCache(cacheState), projects);
+	});
+
+	test('finds the nearest ancestor solution directory within the workspace root', async () => {
+		const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'dotnet-tests-sln-'));
+		const featureDirectory = path.join(tempDirectory, 'src', 'Feature');
+		const projectDirectory = path.join(featureDirectory, 'tests', 'Sample.Tests');
+		const projectPath = path.join(projectDirectory, 'Sample.Tests.csproj');
+
+		try {
+			await fs.mkdir(projectDirectory, { recursive: true });
+			await fs.writeFile(path.join(tempDirectory, 'Root.sln'), '', 'utf8');
+			await fs.writeFile(path.join(featureDirectory, 'Feature.sln'), '', 'utf8');
+			await fs.writeFile(projectPath, '<Project Sdk="Microsoft.NET.Sdk" />', 'utf8');
+
+			assert.strictEqual(
+				await findNearestSolutionDirectory(projectPath, tempDirectory),
+				`${featureDirectory}${path.sep}`,
+			);
+		} finally {
+			await fs.rm(tempDirectory, { recursive: true, force: true });
+		}
+	});
+
+	test('does not resolve a solution outside the workspace root', async () => {
+		const parentDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'dotnet-tests-workspace-'));
+		const workspaceRoot = path.join(parentDirectory, 'workspace');
+		const projectDirectory = path.join(workspaceRoot, 'tests', 'Sample.Tests');
+		const projectPath = path.join(projectDirectory, 'Sample.Tests.csproj');
+
+		try {
+			await fs.mkdir(projectDirectory, { recursive: true });
+			await fs.writeFile(path.join(parentDirectory, 'Outside.sln'), '', 'utf8');
+			await fs.writeFile(projectPath, '<Project Sdk="Microsoft.NET.Sdk" />', 'utf8');
+
+			assert.strictEqual(await findNearestSolutionDirectory(projectPath, workspaceRoot), undefined);
+		} finally {
+			await fs.rm(parentDirectory, { recursive: true, force: true });
+		}
+	});
+
+	test('prefers the nearest indexed solution path during discovery', async () => {
+		const workspaceRoot = path.join('c:', 'repo');
+		const projectPath = path.join(workspaceRoot, 'src', 'Feature', 'tests', 'Sample.Tests', 'Sample.Tests.csproj');
+		const solutionDirectory = await findNearestSolutionDirectory(projectPath, workspaceRoot, [
+			path.join(workspaceRoot, 'Root.sln'),
+			path.join(workspaceRoot, 'src', 'Feature', 'Feature.sln'),
+		]);
+
+		assert.strictEqual(solutionDirectory, `${path.join(workspaceRoot, 'src', 'Feature')}${path.sep}`);
+	});
+
+	test('keeps existing discovery arguments when no solution directory is available', () => {
+		assert.deepStrictEqual(
+			buildListArguments('c:/repo/tests/Sample.Tests/Sample.Tests.csproj', 'vstest'),
+			['test', 'c:/repo/tests/Sample.Tests/Sample.Tests.csproj', '--list-tests', '--nologo'],
+		);
+	});
+
+	test('adds SolutionDir before the separator for legacy mtp discovery and execution', () => {
+		const solutionDirectory = `${path.join('c:', 'repo')}\\`;
+		assert.deepStrictEqual(
+			buildListArguments('c:/repo/tests/Sample.Tests/Sample.Tests.csproj', 'mtp-legacy', solutionDirectory),
+			[
+				'test',
+				'c:/repo/tests/Sample.Tests/Sample.Tests.csproj',
+				`-p:SolutionDir=${solutionDirectory}`,
+				'--',
+				'--list-tests',
+			],
+		);
+
+		assert.deepStrictEqual(
+			buildRunArguments(createProjectNode({ runnerMode: 'mtp-legacy' }), { solutionDirectory }, ['--filter', 'FullyQualifiedName~Sample.Tests.CalculatorTests.Adds_numbers']),
+			[
+				'test',
+				'c:/repo/tests/Sample.Tests/Sample.Tests.csproj',
+				`-p:SolutionDir=${solutionDirectory}`,
+				'--',
+				'--output',
+				'Detailed',
+				'--filter',
+				'FullyQualifiedName~Sample.Tests.CalculatorTests.Adds_numbers',
+			],
+		);
+	});
+
+	test('adds SolutionDir to vstest execution arguments without changing target scope', () => {
+		assert.deepStrictEqual(
+			buildRunArguments(
+				createProjectNode({ runnerMode: 'vstest' }),
+				{ resultsDirectory: 'c:/temp/results', solutionDirectory: 'c:/repo/' },
+				[],
+			),
+			[
+				'test',
+				'c:/repo/tests/Sample.Tests/Sample.Tests.csproj',
+				'--nologo',
+				'--results-directory',
+				'c:/temp/results',
+				'--logger',
+				'console;verbosity=detailed',
+				'--logger',
+				'trx;LogFilePrefix=dotnet-tests',
+				'-p:SolutionDir=c:/repo/',
+			],
+		);
 	});
 
 	test('captures source locations for parsed test classes and methods', async () => {
@@ -524,6 +637,20 @@ function createProjectSnapshot(methodLabels: string[]): DiscoveredProject {
 				})),
 			},
 		],
+	};
+}
+
+function createProjectNode(overrides: Partial<DotnetTestNode> = {}): DotnetTestNode {
+	return {
+		id: 'project:c:/repo/tests/Sample.Tests/Sample.Tests.csproj',
+		kind: 'project',
+		label: 'Sample.Tests',
+		projectPath: 'c:/repo/tests/Sample.Tests/Sample.Tests.csproj',
+		runnerMode: 'vstest',
+		childrenIds: [],
+		state: 'idle',
+		projectUri: vscode.Uri.file('c:/repo/tests/Sample.Tests/Sample.Tests.csproj'),
+		...overrides,
 	};
 }
 
