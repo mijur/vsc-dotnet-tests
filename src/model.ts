@@ -4,14 +4,28 @@ export type RunnerMode = 'vstest' | 'mtp' | 'mtp-legacy';
 export type NodeKind = 'project' | 'class' | 'method';
 export type RunState = 'idle' | 'queued' | 'running' | 'passed' | 'failed' | 'errored' | 'skipped';
 
+export interface DiscoveredSourceRange {
+	startLine: number;
+	startCharacter: number;
+	endLine: number;
+	endCharacter: number;
+}
+
+export interface DiscoveredSourceLocation {
+	filePath: string;
+	range: DiscoveredSourceRange;
+}
+
 export interface DiscoveredMethod {
 	fullyQualifiedName: string;
 	label: string;
+	sourceLocation?: DiscoveredSourceLocation;
 }
 
 export interface DiscoveredClass {
 	fullyQualifiedName: string;
 	label: string;
+	sourceLocation?: DiscoveredSourceLocation;
 	methods: DiscoveredMethod[];
 }
 
@@ -42,6 +56,7 @@ export interface DotnetTestsSnapshotNode {
 	runnerMode: RunnerMode;
 	state: RunState;
 	fullyQualifiedName?: string;
+	sourceLocation?: DiscoveredSourceLocation;
 	children: DotnetTestsSnapshotNode[];
 }
 
@@ -55,6 +70,7 @@ interface DotnetTestNodeBase {
 	state: RunState;
 	parentId?: string;
 	fullyQualifiedName?: string;
+	sourceLocation?: DiscoveredSourceLocation;
 	message?: string;
 	discoveryMessage?: string;
 }
@@ -294,6 +310,7 @@ export class DotnetTestStore {
 				state: previousClassNode?.state ?? 'idle',
 				parentId: projectId,
 				fullyQualifiedName: discoveredClass.fullyQualifiedName,
+				sourceLocation: discoveredClass.sourceLocation,
 			};
 
 			this.nodes.set(classId, classNode);
@@ -312,6 +329,7 @@ export class DotnetTestStore {
 					state: previousMethodNode?.state ?? 'idle',
 					parentId: classId,
 					fullyQualifiedName: method.fullyQualifiedName,
+					sourceLocation: method.sourceLocation,
 					message: previousMethodNode?.message,
 				};
 
@@ -388,6 +406,7 @@ export class DotnetTestStore {
 			runnerMode: node.runnerMode,
 			state: node.state,
 			fullyQualifiedName: node.fullyQualifiedName,
+			sourceLocation: node.sourceLocation,
 			children: this.getChildren(node).map(child => this.snapshotNode(child)),
 		};
 	}

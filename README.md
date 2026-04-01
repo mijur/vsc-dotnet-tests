@@ -8,6 +8,7 @@ Dotnet Tests is a VS Code extension for discovering and running .NET tests direc
 - Uses `dotnet test --list-tests` to build a nested project, class, and method tree.
 - Publishes the discovered hierarchy into VS Code's native Testing API.
 - Relies on the built-in Testing pane for browsing and running tests.
+- Adds source locations to discovered test classes and methods so VS Code can navigate from test items and result messages back to code.
 - Runs a selected test method, class, or project.
 - Runs all discovered test projects.
 - Propagates the last run state down to discovered methods when a project or class run emits detailed outcomes.
@@ -18,11 +19,14 @@ Dotnet Tests is a VS Code extension for discovering and running .NET tests direc
 ## Commands
 
 - `Dotnet Tests: Show Actions` opens a quick-pick for refresh, run, reveal, and output commands.
+- `Dotnet Tests: Go to Test Source` opens a discovered test class or method in the editor.
 - `Dotnet Tests: Refresh Discovered Tests` forces a full workspace rediscovery.
 - `Dotnet Tests: Run All Tests` runs every discovered .NET test project.
 - `Dotnet Tests: Run Test Target` lets you pick a discovered project, class, or method to run.
 - `Dotnet Tests: Reveal in Testing View` lets you pick a discovered project, class, or method and focus it in the Testing pane.
 - `Dotnet Tests: Show Output` opens the extension output channel.
+
+You can also use `Go to Test Source` from a discovered test class or method's context menu in the Testing view, and VS Code can use the attached source locations for direct navigation from test UI elements.
 
 ## Requirements
 

@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import * as vscode from 'vscode';
-import { alignSourceClassesWithListedTests, parseCSharpTests } from './csharpParser';
+import { alignSourceClassesWithListedTests, mergeSourceLocationsIntoListedClasses, parseCSharpTests } from './csharpParser';
 import {
 	type DiscoveredClass,
 	type DiscoveredMethod,
@@ -26,6 +26,9 @@ const TEST_PROJECT_PATTERNS = [
 	/Include=["']NUnit(?:\.[^"']+)?["']/i,
 	/Include=["']NUnit3TestAdapter["']/i,
 	/Include=["']Microsoft\.Testing\.Extensions\.VSTestBridge["']/i,
+];
+const XUNIT_MTP_PACKAGE_PATTERNS = [
+	/Include=["']xunit\.v3(?:\.[^"']+)?["']/i,
 ];
 
 type CompletedRunState = Exclude<RunState, 'idle' | 'queued' | 'running'>;
@@ -102,9 +105,11 @@ export async function discoverProject(projectPath: string, output: vscode.Output
 		const result = await executeDotnet(args, path.dirname(projectPath), output);
 		const tests = parseDiscoveredTests(result.combined);
 		let classes = groupTestsIntoClasses(tests);
+		const sourceClasses = await tryParseSourceClasses(projectPath, output);
 		if (classes.length === 0 || tests.every(test => !test.includes('.'))) {
-			const sourceClasses = await parseCSharpTests(projectPath);
-			classes = alignSourceClassesWithListedTests(sourceClasses, tests);
+			classes = sourceClasses ? alignSourceClassesWithListedTests(sourceClasses, tests) : classes;
+		} else if (sourceClasses) {
+			classes = mergeSourceLocationsIntoListedClasses(classes, sourceClasses);
 		}
 
 		return {
@@ -122,6 +127,15 @@ export async function discoverProject(projectPath: string, output: vscode.Output
 			classes: [],
 			warning: getErrorMessage(error),
 		};
+	}
+}
+
+async function tryParseSourceClasses(projectPath: string, output: vscode.OutputChannel): Promise<DiscoveredClass[] | undefined> {
+	try {
+		return await parseCSharpTests(projectPath);
+	} catch (error) {
+		output.appendLine(`Failed to parse C# test sources for ${projectPath}: ${getErrorMessage(error)}`);
+		return undefined;
 	}
 }
 
@@ -276,16 +290,18 @@ function buildListArguments(projectPath: string, runnerMode: RunnerMode): string
 }
 
 async function createRunContext(node: DotnetTestNode): Promise<RunContext> {
+	const filterArguments = await buildFilterArguments(node);
+
 	if (node.runnerMode === 'vstest') {
 		const resultsDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'dotnet-tests-'));
 		return {
 			resultsDirectory,
-			args: buildRunArguments(node, { resultsDirectory }),
+			args: buildRunArguments(node, { resultsDirectory }, filterArguments),
 		};
 	}
 
 	return {
-		args: buildRunArguments(node, {}),
+		args: buildRunArguments(node, {}, filterArguments),
 	};
 }
 
@@ -297,21 +313,19 @@ async function cleanupRunContext(runContext: RunContext): Promise<void> {
 	await fs.rm(runContext.resultsDirectory, { recursive: true, force: true });
 }
 
-function buildRunArguments(node: DotnetTestNode, runContext: RunArgumentOptions): string[] {
-	const filter = buildFilter(node);
-
+function buildRunArguments(node: DotnetTestNode, runContext: RunArgumentOptions, filterArguments: string[]): string[] {
 	switch (node.runnerMode) {
 		case 'mtp': {
 			const args = ['test', '--project', node.projectPath, '--no-ansi', '--no-progress', '--output', 'Detailed'];
-			if (filter) {
-				args.push('--filter', filter);
+			if (filterArguments.length > 0) {
+				args.push(...filterArguments);
 			}
 			return args;
 		}
 		case 'mtp-legacy': {
 			const args = ['test', node.projectPath, '--', '--output', 'Detailed'];
-			if (filter) {
-				args.push('--filter', filter);
+			if (filterArguments.length > 0) {
+				args.push(...filterArguments);
 			}
 			return args;
 		}
@@ -327,15 +341,47 @@ function buildRunArguments(node: DotnetTestNode, runContext: RunArgumentOptions)
 				'--logger',
 				`trx;LogFilePrefix=${TRX_LOG_FILE_PREFIX}`,
 			];
-			if (filter) {
-				args.push('--filter', filter);
+			if (filterArguments.length > 0) {
+				args.push(...filterArguments);
 			}
 			return args;
 		}
 	}
 }
 
-function buildFilter(node: DotnetTestNode): string | undefined {
+async function buildFilterArguments(node: DotnetTestNode): Promise<string[]> {
+	if (node.kind === 'project' || !node.fullyQualifiedName) {
+		return [];
+	}
+
+	if (node.runnerMode === 'mtp' || node.runnerMode === 'mtp-legacy') {
+		const projectText = await tryReadProjectText(node.projectPath);
+		if (projectText && usesXunitMtpFilters(projectText)) {
+			if (node.kind === 'class') {
+				return ['--filter-class', node.fullyQualifiedName];
+			}
+
+			return ['--filter-method', normalizeMethodFullyQualifiedName(node.fullyQualifiedName)];
+		}
+	}
+
+	const filter = buildVstestFilter(node);
+	return filter ? ['--filter', filter] : [];
+}
+
+async function tryReadProjectText(projectPath: string): Promise<string | undefined> {
+	try {
+		return await fs.readFile(projectPath, 'utf8');
+	} catch {
+		return undefined;
+	}
+}
+
+function usesXunitMtpFilters(projectText: string): boolean {
+	return XUNIT_MTP_PACKAGE_PATTERNS.some(pattern => pattern.test(projectText));
+}
+
+function buildVstestFilter(node: DotnetTestNode): string | undefined {
 	if (node.kind === 'project' || !node.fullyQualifiedName) {
 		return undefined;
 	}
@@ -344,8 +390,12 @@ function buildFilter(node: DotnetTestNode): string | undefined {
 		return `FullyQualifiedName~${escapeFilterValue(`${node.fullyQualifiedName}.`)}`;
 	}
 
-	const normalized = node.fullyQualifiedName.replace(/\(.*\)$/, '');
+	const normalized = normalizeMethodFullyQualifiedName(node.fullyQualifiedName);
 	return `FullyQualifiedName~${escapeFilterValue(normalized)}`;
+}
+
+function normalizeMethodFullyQualifiedName(value: string): string {
+	return value.replace(/\(.*\)$/, '');
 }
 
 function escapeFilterValue(value: string): string {
@@ -665,13 +715,16 @@ function extractReportedTestName(text: string): string | undefined {
 		.replace(/\s+\[[\d.]+\s*(?:ms|s)\]\s*$/i, '')
 		.replace(/\s+\([\d.]+\s*(?:ms|s)\)\s*$/i, '')
 		.trim();
+	const normalizedCandidate = stripParameterizedSuffix(candidate);
 
 	const trailingNameMatch = candidate.match(/[A-Za-z_][\w`<>, +\[\]-]*(?:\.[A-Za-z_][\w`<>, +\[\]-]*)+(?:\([^)]*\))?$/);
 	if (trailingNameMatch) {
 		return trailingNameMatch[0].trim();
 	}
 
-	return looksLikeTestName(stripParameterizedSuffix(candidate)) ? candidate : undefined;
+	return looksLikeTestName(normalizedCandidate) || looksLikeReportedMethodLabel(normalizedCandidate)
+		? candidate
+		: undefined;
 }
 
 function dedupeDetailedResults(results: DetailedTestResult[]): DetailedTestResult[] {
@@ -918,6 +971,14 @@ function looksLikeTestName(line: string): boolean {
 
 	const normalized = line.replace(/\(.*\)$/, '');
 	return /^[A-Za-z_][\w`<>, +\[\]-]*(\.[A-Za-z_][\w`<>, +\[\]-]*)+$/.test(normalized);
+}
+
+function looksLikeReportedMethodLabel(line: string): boolean {
+	if (!line || line.includes('\\') || line.includes('/')) {
+		return false;
+	}
+
+	return /^[A-Za-z_][\w`<>, +\[\]-]*$/.test(line);
 }
 
 function isNoiseLine(line: string): boolean {

@@ -3,10 +3,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as assert from 'assert';
 import * as vscode from 'vscode';
-import { parseCSharpTests } from '../csharpParser';
+import { mergeSourceLocationsIntoListedClasses, parseCSharpTests } from '../csharpParser';
 import { DISCOVERY_CACHE_KEY, readDiscoveryCache, writeDiscoveryCache } from '../discoveryCache';
 import { parseDetailedResultLine, parseDetailedResultsFromOutput, parseTrxResultsXml } from '../dotnet';
-import type { DotnetTestsApi } from '../extension';
+import { createUnreportedMethodCompletion, type DotnetTestsApi } from '../extension';
 import { DotnetTestStore, type DiscoveredProject, type DotnetTestsSnapshotNode } from '../model';
 
 suite('Extension Test Suite', () => {
@@ -18,6 +18,17 @@ suite('Extension Test Suite', () => {
 			fullyQualifiedName: 'Tests.SampleProject.CalculatorTests.Adds_numbers',
 			state: 'passed',
 			durationMs: 12,
+		});
+	});
+
+	test('parses a single detailed result line when only the method label is reported', () => {
+		const result = parseDetailedResultLine('Failed create_buyer_item_success [3 ms]');
+
+		assert.deepStrictEqual(result, {
+			name: 'create_buyer_item_success',
+			fullyQualifiedName: undefined,
+			state: 'failed',
+			durationMs: 3,
 		});
 	});
 
@@ -34,6 +45,21 @@ suite('Extension Test Suite', () => {
 				{ name: 'Tests.SampleProject.CalculatorTests.Adds_numbers', state: 'passed', durationMs: 12 },
 				{ name: 'Tests.SampleProject.CalculatorTests.Subtracts_numbers', state: 'failed', durationMs: 3 },
 				{ name: 'Tests.SampleProject.CalculatorTests.Multiplies_numbers', state: 'skipped', durationMs: 1 },
+			],
+		);
+	});
+
+	test('parses detailed console output into per-test results when only method labels are reported', () => {
+		const results = parseDetailedResultsFromOutput([
+			'Passed add_payment_success [12 ms]',
+			'Failed create_buyer_item_success [3 ms]',
+		].join('\n'));
+
+		assert.deepStrictEqual(
+			results.map(result => ({ name: result.name, state: result.state, durationMs: result.durationMs })),
+			[
+				{ name: 'add_payment_success', state: 'passed', durationMs: 12 },
+				{ name: 'create_buyer_item_success', state: 'failed', durationMs: 3 },
 			],
 		);
 	});
@@ -95,10 +121,28 @@ suite('Extension Test Suite', () => {
 					{
 						fullyQualifiedName: 'Sample.Tests.CalculatorTests',
 						label: 'CalculatorTests',
+						sourceLocation: {
+							filePath: 'c:/repo/tests/Sample.Tests/CalculatorTests.cs',
+							range: {
+								startLine: 1,
+								startCharacter: 13,
+								endLine: 1,
+								endCharacter: 28,
+							},
+						},
 						methods: [
 							{
 								fullyQualifiedName: 'Sample.Tests.CalculatorTests.Adds_numbers',
 								label: 'Adds_numbers',
+								sourceLocation: {
+									filePath: 'c:/repo/tests/Sample.Tests/CalculatorTests.cs',
+									range: {
+										startLine: 4,
+										startCharacter: 16,
+										endLine: 4,
+										endCharacter: 28,
+									},
+								},
 							},
 						],
 					},
@@ -109,6 +153,113 @@ suite('Extension Test Suite', () => {
 		await writeDiscoveryCache(cacheState, projects);
 
 		assert.deepStrictEqual(readDiscoveryCache(cacheState), projects);
+	});
+
+	test('captures source locations for parsed test classes and methods', async () => {
+		const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'dotnet-tests-source-'));
+		const projectPath = path.join(tempDirectory, 'Sample.Tests.csproj');
+		const filePath = path.join(tempDirectory, 'CalculatorTests.cs');
+
+		try {
+			await fs.writeFile(projectPath, '<Project Sdk="Microsoft.NET.Sdk" />', 'utf8');
+			await fs.writeFile(filePath, [
+				'namespace Sample.Tests;',
+				'public class CalculatorTests',
+				'{',
+				'    [Fact]',
+				'    public void Adds_numbers() {}',
+				'}',
+			].join('\n'), 'utf8');
+
+			const classes = await parseCSharpTests(projectPath);
+			assert.deepStrictEqual(classes[0]?.sourceLocation, {
+				filePath,
+				range: {
+					startLine: 1,
+					startCharacter: 13,
+					endLine: 1,
+					endCharacter: 28,
+				},
+			});
+			assert.deepStrictEqual(classes[0]?.methods[0]?.sourceLocation, {
+				filePath,
+				range: {
+					startLine: 4,
+					startCharacter: 16,
+					endLine: 4,
+					endCharacter: 28,
+				},
+			});
+		} finally {
+			await fs.rm(tempDirectory, { recursive: true, force: true });
+		}
+	});
+
+	test('merges source locations into listed tests', () => {
+		const merged = mergeSourceLocationsIntoListedClasses(
+			[
+				{
+					fullyQualifiedName: 'Sample.Tests.CalculatorTests',
+					label: 'CalculatorTests',
+					sourceLocation: {
+						filePath: 'c:/repo/tests/Sample.Tests/CalculatorTests.cs',
+						range: {
+							startLine: 1,
+							startCharacter: 13,
+							endLine: 1,
+							endCharacter: 28,
+						},
+					},
+					methods: [
+						{
+							fullyQualifiedName: 'Sample.Tests.CalculatorTests.Adds_numbers',
+							label: 'Adds_numbers',
+						},
+					],
+				},
+			],
+			[
+				{
+					fullyQualifiedName: 'Sample.Tests.CalculatorTests',
+					label: 'CalculatorTests',
+					methods: [
+						{
+							fullyQualifiedName: 'Sample.Tests.CalculatorTests.Adds_numbers',
+							label: 'Adds_numbers',
+							sourceLocation: {
+								filePath: 'c:/repo/tests/Sample.Tests/CalculatorTests.cs',
+								range: {
+									startLine: 4,
+									startCharacter: 16,
+									endLine: 4,
+									endCharacter: 28,
+								},
+							},
+						},
+					],
+				},
+			],
+		);
+
+		assert.deepStrictEqual(merged[0]?.sourceLocation, {
+			filePath: 'c:/repo/tests/Sample.Tests/CalculatorTests.cs',
+			range: {
+				startLine: 1,
+				startCharacter: 13,
+				endLine: 1,
+				endCharacter: 28,
+			},
+		});
+
+		assert.deepStrictEqual(merged[0]?.methods[0]?.sourceLocation, {
+			filePath: 'c:/repo/tests/Sample.Tests/CalculatorTests.cs',
+			range: {
+				startLine: 4,
+				startCharacter: 16,
+				endLine: 4,
+				endCharacter: 28,
+			},
+		});
 	});
 
 	test('ignores invalid discovery cache entries', () => {
@@ -188,6 +339,28 @@ suite('Extension Test Suite', () => {
 		assert.strictEqual(findNodeByLabel(runningProject!, 'Subtracts_numbers')?.state, 'running');
 	});
 
+	test('marks unreported methods as skipped after a completed batch run', () => {
+		assert.deepStrictEqual(createUnreportedMethodCompletion('passed'), {
+			state: 'skipped',
+			message: 'Skipped',
+		});
+		assert.deepStrictEqual(createUnreportedMethodCompletion('failed'), {
+			state: 'skipped',
+			message: 'Skipped',
+		});
+		assert.deepStrictEqual(createUnreportedMethodCompletion('skipped'), {
+			state: 'skipped',
+			message: 'Skipped',
+		});
+	});
+
+	test('marks unreported methods as errored after an errored batch run', () => {
+		assert.deepStrictEqual(createUnreportedMethodCompletion('errored'), {
+			state: 'errored',
+			message: 'Errored',
+		});
+	});
+
 	test('parses overridden file contents for live editor updates', async () => {
 		const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'dotnet-tests-source-'));
 		const projectPath = path.join(tempDirectory, 'Sample.Tests.csproj');
@@ -228,6 +401,7 @@ suite('Extension Test Suite', () => {
 		const commands = await vscode.commands.getCommands(true);
 		for (const command of [
 			'dotnet-tests.actions',
+			'dotnet-tests.openTestSource',
 			'dotnet-tests.refresh',
 			'dotnet-tests.runAll',
 			'dotnet-tests.runNode',
@@ -279,6 +453,36 @@ suite('Extension Test Suite', () => {
 		const methodStates = collectMethodStates(updatedProject!);
 		assert.ok(methodStates.length > 0, 'Expected Basket.UnitTests to include discovered methods after execution.');
 		assert.ok(methodStates.every(state => state !== 'idle'), 'Expected a project run to update every discovered method state.');
+	});
+
+	test('runs an individual Ordering.FunctionalTests method in the configured target workspace', async function () {
+		const targetWorkspace = process.env.DOTNET_TESTS_TARGET_WORKSPACE;
+		if (!targetWorkspace) {
+			this.skip();
+			return;
+		}
+
+		const extension = vscode.extensions.getExtension<DotnetTestsApi>('local.dotnet-tests');
+		assert.ok(extension, 'Expected the extension under test to be available.');
+		const api = await extension!.activate();
+		await api.refresh();
+
+		const snapshot = api.getSnapshot();
+		const orderingProject = snapshot.find(node => node.label === 'Ordering.FunctionalTests');
+		assert.ok(orderingProject, 'Expected Ordering.FunctionalTests to be discovered.');
+
+		const method = findNodeByLabel(orderingProject!, 'GetAllStoredOrdersWorks');
+		assert.ok(method, 'Expected GetAllStoredOrdersWorks to be discovered.');
+		assert.strictEqual(method?.kind, 'method', 'Expected GetAllStoredOrdersWorks to resolve to a method node.');
+
+		const runSummary = await api.runNodeById(method!.id);
+		assert.ok(runSummary, 'Expected a run summary from executing GetAllStoredOrdersWorks.');
+		assert.strictEqual(runSummary?.total ?? 0, 1, 'Expected a single method run to execute exactly one test.');
+		assert.strictEqual(runSummary?.failed ?? 0, 0, 'Expected GetAllStoredOrdersWorks to pass in the target repository.');
+
+		const updatedProject = api.getSnapshot().find(node => node.id === orderingProject!.id);
+		assert.ok(updatedProject, 'Expected Ordering.FunctionalTests to remain in the snapshot after execution.');
+		assert.strictEqual(findNodeByLabel(updatedProject!, 'GetAllStoredOrdersWorks')?.state, 'passed');
 	});
 });
 

@@ -1,13 +1,11 @@
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
-import { type DiscoveredClass, type DiscoveredMethod } from './model';
+import { type DiscoveredClass, type DiscoveredMethod, type DiscoveredSourceLocation } from './model';
 
 const TEST_METHOD_ATTRIBUTE_PATTERN = /\b(TestMethod|DataTestMethod|Fact|Theory|Test|TestCase|TestCaseSource|SkippableFact|SkippableTheory)\b/i;
 const TEST_CLASS_ATTRIBUTE_PATTERN = /\b(TestClass|TestFixture)\b/i;
 
-interface ParsedMethod extends DiscoveredMethod {
-	classFullyQualifiedName: string;
-}
+interface ParsedClass extends DiscoveredClass {}
 
 export interface ParseCSharpTestsOptions {
 	fileContents?: ReadonlyMap<string, string>;
@@ -16,28 +14,31 @@ export interface ParseCSharpTestsOptions {
 export async function parseCSharpTests(projectPath: string, options: ParseCSharpTestsOptions = {}): Promise<DiscoveredClass[]> {
 	const projectDirectory = path.dirname(projectPath);
 	const files = await collectCSharpFiles(projectDirectory);
-	const classes = new Map<string, DiscoveredMethod[]>();
+	const classes = new Map<string, DiscoveredClass>();
 	const normalizedFileContents = options.fileContents
 		? new Map([...options.fileContents.entries()].map(([filePath, contents]) => [normalizeFilePath(filePath), contents]))
 		: undefined;
 
 	for (const filePath of files) {
 		const contents = normalizedFileContents?.get(normalizeFilePath(filePath)) ?? await fs.readFile(filePath, 'utf8');
-		for (const parsedMethod of parseMethodsFromSource(contents)) {
-			const methods = classes.get(parsedMethod.classFullyQualifiedName) ?? [];
-			methods.push({
-				fullyQualifiedName: parsedMethod.fullyQualifiedName,
-				label: parsedMethod.label,
+		for (const parsedClass of parseClassesFromSource(contents, filePath)) {
+			const existingClass = classes.get(parsedClass.fullyQualifiedName);
+			classes.set(parsedClass.fullyQualifiedName, {
+				fullyQualifiedName: parsedClass.fullyQualifiedName,
+				label: parsedClass.label,
+				sourceLocation: existingClass?.sourceLocation ?? parsedClass.sourceLocation,
+				methods: [
+					...(existingClass?.methods ?? []),
+					...parsedClass.methods,
+				],
 			});
-			classes.set(parsedMethod.classFullyQualifiedName, methods);
 		}
 	}
 
-	return [...classes.entries()]
-		.map(([fullyQualifiedName, methods]) => ({
-			fullyQualifiedName,
-			label: fullyQualifiedName.split('.').at(-1) ?? fullyQualifiedName,
-			methods: dedupeMethods(methods),
+	return [...classes.values()]
+		.map(discoveredClass => ({
+			...discoveredClass,
+			methods: dedupeMethods(discoveredClass.methods),
 		}))
 		.sort((left, right) => left.label.localeCompare(right.label));
 }
@@ -68,6 +69,30 @@ export function alignSourceClassesWithListedTests(
 		.filter(discoveredClass => discoveredClass.methods.length > 0);
 }
 
+export function mergeSourceLocationsIntoListedClasses(
+	classes: readonly DiscoveredClass[],
+	sourceClasses: readonly DiscoveredClass[],
+): DiscoveredClass[] {
+	const sourceClassLocations = new Map(sourceClasses.map(discoveredClass => [discoveredClass.fullyQualifiedName, discoveredClass.sourceLocation]));
+	const sourceMethods = new Map<string, DiscoveredMethod>();
+	for (const sourceClass of sourceClasses) {
+		for (const method of sourceClass.methods) {
+			sourceMethods.set(method.fullyQualifiedName, method);
+		}
+	}
+
+	return classes.map(discoveredClass => ({
+		...discoveredClass,
+		sourceLocation: sourceClassLocations.get(discoveredClass.fullyQualifiedName) ?? discoveredClass.sourceLocation,
+		methods: discoveredClass.methods.map(method => {
+			const sourceMethod = sourceMethods.get(method.fullyQualifiedName);
+			return sourceMethod?.sourceLocation
+				? { ...method, sourceLocation: sourceMethod.sourceLocation }
+				: method;
+		}),
+	}));
+}
+
 async function collectCSharpFiles(directoryPath: string): Promise<string[]> {
 	const entries = await fs.readdir(directoryPath, { withFileTypes: true });
 	const files: string[] = [];
@@ -91,18 +116,18 @@ async function collectCSharpFiles(directoryPath: string): Promise<string[]> {
 	return files;
 }
 
-function parseMethodsFromSource(source: string): ParsedMethod[] {
+function parseClassesFromSource(source: string, filePath: string): ParsedClass[] {
 	const lines = source.split(/\r?\n/);
-	const results: ParsedMethod[] = [];
+	const classEntries = new Map<string, ParsedClass>();
 	let namespaceName = '';
 	let braceDepth = 0;
 	let pendingAttributes: string[] = [];
 	let attributeBuffer = '';
 	let collectingAttribute = false;
-	let pendingClass: { name: string; isTestClass: boolean } | undefined;
-	const classStack: Array<{ name: string; depth: number; isTestClass: boolean }> = [];
+	let pendingClass: { name: string; isTestClass: boolean; sourceLocation: DiscoveredSourceLocation } | undefined;
+	const classStack: Array<{ name: string; depth: number; isTestClass: boolean; sourceLocation: DiscoveredSourceLocation }> = [];
 
-	for (const line of lines) {
+	for (const [lineIndex, line] of lines.entries()) {
 		const trimmed = line.trim();
 
 		if (!namespaceName) {
@@ -130,9 +155,12 @@ function parseMethodsFromSource(source: string): ParsedMethod[] {
 
 		const classMatch = trimmed.match(/\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b/);
 		if (classMatch) {
+			const indentation = line.length - line.trimStart().length;
+			const classColumn = indentation + trimmed.indexOf(classMatch[1]);
 			pendingClass = {
 				name: classMatch[1],
 				isTestClass: pendingAttributes.some(attribute => TEST_CLASS_ATTRIBUTE_PATTERN.test(attribute)),
+				sourceLocation: createSourceLocation(filePath, lineIndex, classColumn, classMatch[1].length),
 			};
 			pendingAttributes = [];
 		}
@@ -140,12 +168,21 @@ function parseMethodsFromSource(source: string): ParsedMethod[] {
 		const activeClass = classStack.at(-1);
 		const methodMatch = trimmed.match(/^(?:\[[^\]]+\]\s*)*(?:public|internal|private|protected|static|virtual|sealed|override|new|unsafe|extern|partial|async|\s)+[A-Za-z_][\w<>,.?\[\]\s]*\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
 		if (activeClass && methodMatch && pendingAttributes.some(attribute => TEST_METHOD_ATTRIBUTE_PATTERN.test(attribute))) {
-			const className = [namespaceName, ...classStack.map(entry => entry.name)].filter(Boolean).join('.');
-			results.push({
-				classFullyQualifiedName: className,
+			const className = createClassFullyQualifiedName(namespaceName, classStack);
+			const classEntry = classEntries.get(className) ?? {
+				fullyQualifiedName: className,
+				label: className.split('.').at(-1) ?? className,
+				sourceLocation: activeClass.sourceLocation,
+				methods: [],
+			};
+			const indentation = line.length - line.trimStart().length;
+			const methodColumn = indentation + trimmed.indexOf(methodMatch[1]);
+			classEntry.methods.push({
 				fullyQualifiedName: `${className}.${methodMatch[1]}`,
 				label: methodMatch[1],
+				sourceLocation: createSourceLocation(filePath, lineIndex, methodColumn, methodMatch[1].length),
 			});
+			classEntries.set(className, classEntry);
 			pendingAttributes = [];
 		}
 
@@ -157,6 +194,15 @@ function parseMethodsFromSource(source: string): ParsedMethod[] {
 				name: pendingClass.name,
 				depth: braceDepth,
 				isTestClass: pendingClass.isTestClass,
+				sourceLocation: pendingClass.sourceLocation,
+			});
+			const className = createClassFullyQualifiedName(namespaceName, classStack);
+			const existingClass = classEntries.get(className);
+			classEntries.set(className, {
+				fullyQualifiedName: className,
+				label: pendingClass.name,
+				sourceLocation: existingClass?.sourceLocation ?? pendingClass.sourceLocation,
+				methods: existingClass?.methods ?? [],
 			});
 			pendingClass = undefined;
 		}
@@ -171,7 +217,27 @@ function parseMethodsFromSource(source: string): ParsedMethod[] {
 		}
 	}
 
-	return results.filter(result => result.classFullyQualifiedName.length > 0);
+	return [...classEntries.values()]
+		.filter(discoveredClass => discoveredClass.fullyQualifiedName.length > 0 && discoveredClass.methods.length > 0);
+}
+
+function createClassFullyQualifiedName(
+	namespaceName: string,
+	classStack: ReadonlyArray<{ name: string }>,
+): string {
+	return [namespaceName, ...classStack.map(entry => entry.name)].filter(Boolean).join('.');
+}
+
+function createSourceLocation(filePath: string, line: number, character: number, length: number): DiscoveredSourceLocation {
+	return {
+		filePath,
+		range: {
+			startLine: line,
+			startCharacter: character,
+			endLine: line,
+			endCharacter: character + length,
+		},
+	};
 }
 
 function dedupeMethods(methods: DiscoveredMethod[]): DiscoveredMethod[] {

@@ -22,6 +22,11 @@
         "category": "Dotnet Tests"
       },
       {
+        "command": "dotnet-tests.openTestSource",
+        "title": "Go to Test Source",
+        "category": "Dotnet Tests"
+      },
+      {
         "command": "dotnet-tests.refresh",
         "title": "Refresh Discovered Tests",
         "category": "Dotnet Tests"
@@ -46,7 +51,23 @@
         "title": "Reveal in Testing View",
         "category": "Dotnet Tests"
       }
-    ]
+    ],
+    "menus": {
+      "testing/item/context": [
+        {
+          "command": "dotnet-tests.openTestSource",
+          "when": "controllerId == 'dotnet-tests.controller' && testId =~ /^(class|method):/ && testItemHasUri",
+          "group": "navigation"
+        }
+      ],
+      "testing/message/context": [
+        {
+          "command": "dotnet-tests.openTestSource",
+          "when": "testMessage == 'dotnet-tests.source'",
+          "group": "navigation"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

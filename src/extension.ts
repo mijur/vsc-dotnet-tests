@@ -11,7 +11,7 @@ import {
 	type DotnetCommandResult,
 	type RunDotnetTargetOptions,
 } from './dotnet';
-import { DotnetTestStore, formatRunnerMode, type DiscoveredProject, type DotnetTestNode, type DotnetTestsSnapshotNode, type MethodNode, type NodeStateUpdate, type ProjectNode, type RunSummary, type RunState } from './model';
+import { DotnetTestStore, formatRunnerMode, type DiscoveredProject, type DiscoveredSourceLocation, type DotnetTestNode, type DotnetTestsSnapshotNode, type MethodNode, type NodeStateUpdate, type ProjectNode, type RunSummary, type RunState } from './model';
 
 export interface DotnetTestsApi {
 	refresh(): Promise<void>;
@@ -31,6 +31,7 @@ export function deactivate() {}
 const FILE_REFRESH_DELAY_MS = 750;
 const DOCUMENT_REFRESH_DELAY_MS = 150;
 const RECENT_SAVE_TTL_MS = 1000;
+const SOURCE_TEST_MESSAGE_CONTEXT = 'dotnet-tests.source';
 
 class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 	private readonly store = new DotnetTestStore();
@@ -68,6 +69,7 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 			this.controller,
 			vscode.commands.registerCommand('dotnet-tests.refresh', () => this.refresh(true)),
 			vscode.commands.registerCommand('dotnet-tests.actions', () => this.showActions()),
+			vscode.commands.registerCommand('dotnet-tests.openTestSource', (argument?: unknown) => this.openTestSource(argument)),
 			vscode.commands.registerCommand('dotnet-tests.runAll', () => this.runAll()),
 			vscode.commands.registerCommand('dotnet-tests.showOutput', () => this.output.show(true)),
 			vscode.commands.registerCommand('dotnet-tests.runNode', (argument?: unknown) => this.runNode(argument)),
@@ -348,8 +350,10 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 	}
 
 	private createTestItem(node: DotnetTestNode): vscode.TestItem {
-		const uri = node.kind === 'project' ? node.projectUri : undefined;
+		const sourceTarget = createNavigationTargetFromNode(node);
+		const uri = sourceTarget?.uri ?? (node.kind === 'project' ? node.projectUri : undefined);
 		const item = this.controller.createTestItem(node.id, node.label, uri);
+		item.range = sourceTarget?.range;
 		item.description = createTestItemDescription(node);
 		this.testItems.set(node.id, item);
 
@@ -437,14 +441,14 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 			try {
 				const result = await this.runTrackedTarget(node, methodTracker, run, token);
 				const message = formatNodeSummary(result.summary, result.status);
-				const inheritedMethodCompletion = createInheritedMethodCompletion(result.status);
+				const unreportedMethodCompletion = createUnreportedMethodCompletion(result.status);
 				const detailedResultMethodIds = this.applyDetailedResults(node, result, run, message, methodTracker);
 				this.completeUnreportedMethods(
 					methodTracker,
 					collectReportedMethodIds(methodTracker, detailedResultMethodIds),
 					run,
-					inheritedMethodCompletion.state,
-					inheritedMethodCompletion.message,
+					unreportedMethodCompletion.state,
+					unreportedMethodCompletion.message,
 				);
 
 				const appliedDetailedResults = detailedResultMethodIds !== undefined;
@@ -484,7 +488,7 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 				this.store.setNodeState(node.id, 'errored', message);
 
 				if (item) {
-					run.errored(item, new vscode.TestMessage(message));
+						run.errored(item, createTestRunMessage(message, item));
 				}
 
 				run.appendOutput(`${message}\r\n`);
@@ -737,6 +741,15 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 		return picks;
 	}
 
+	private createSourceNodePicks(): NodePick[] {
+		const picks: NodePick[] = [];
+		for (const project of this.store.getRoots()) {
+			this.appendSourceNodePick(project, picks);
+		}
+
+		return picks;
+	}
+
 	private appendNodePick(node: DotnetTestNode, picks: NodePick[]): void {
 		picks.push({
 			label: node.label,
@@ -747,6 +760,21 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 
 		for (const child of this.store.getChildren(node)) {
 			this.appendNodePick(child, picks);
+		}
+	}
+
+	private appendSourceNodePick(node: DotnetTestNode, picks: NodePick[]): void {
+		if (node.kind !== 'project' && node.sourceLocation) {
+			picks.push({
+				label: node.label,
+				description: createNodePickDescription(node, this.store),
+				detail: createNodePickDetail(node),
+				node,
+			});
+		}
+
+		for (const child of this.store.getChildren(node)) {
+			this.appendSourceNodePick(child, picks);
 		}
 	}
 
@@ -766,6 +794,11 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 				label: 'Run a discovered test target',
 				detail: 'Pick a discovered project, class, or method to run.',
 				run: () => this.runNode(),
+			},
+			{
+				label: 'Open a discovered test source',
+				detail: 'Pick a discovered test class or method and open its source location.',
+				run: () => this.openTestSource(),
 			},
 			{
 				label: 'Reveal a discovered test target',
@@ -800,6 +833,55 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 		}
 
 		await vscode.commands.executeCommand('vscode.revealTestInExplorer', item);
+	}
+
+	private async openTestSource(argument?: unknown): Promise<void> {
+		const target = this.resolveNavigationTarget(argument) ?? await this.pickSourceNavigationTarget();
+		if (!target) {
+			return;
+		}
+
+		await openNavigationTarget(target);
+	}
+
+	private resolveNavigationTarget(argument?: unknown): NavigationTarget | undefined {
+		if (isTestMessageCommandArgument(argument)) {
+			const messageTarget = createNavigationTargetFromLocation(argument.message?.location);
+			if (messageTarget) {
+				return messageTarget;
+			}
+
+			if (argument.test) {
+				return this.resolveNodeNavigationTarget(argument.test);
+			}
+		}
+
+		return this.resolveNodeNavigationTarget(argument);
+	}
+
+	private resolveNodeNavigationTarget(argument?: unknown): NavigationTarget | undefined {
+		const node = this.resolveNode(argument);
+		return node ? createNavigationTargetFromNode(node) : undefined;
+	}
+
+	private async pickSourceNavigationTarget(): Promise<NavigationTarget | undefined> {
+		if (!(await this.ensureProjectsDiscovered())) {
+			return undefined;
+		}
+
+		const picks = this.createSourceNodePicks();
+		if (picks.length === 0) {
+			void vscode.window.showInformationMessage('No discovered .NET test classes or methods with source locations are available.');
+			return undefined;
+		}
+
+		const pick = await vscode.window.showQuickPick(picks, {
+			placeHolder: 'Select a .NET test class or method to open',
+			matchOnDescription: true,
+			matchOnDetail: true,
+		});
+
+		return pick ? createNavigationTargetFromNode(pick.node) : undefined;
 	}
 
 	private syncProjectWatchers(): void {
@@ -1075,6 +1157,16 @@ interface NodePick extends vscode.QuickPickItem {
 	node: DotnetTestNode;
 }
 
+interface NavigationTarget {
+	uri: vscode.Uri;
+	range?: vscode.Range;
+}
+
+interface TestMessageCommandArgument {
+	test?: { id: string };
+	message?: vscode.TestMessage;
+}
+
 interface MethodRunResult {
 	method: MethodNode;
 	state: RunState;
@@ -1118,12 +1210,14 @@ function collectReportedMethodIds(
 	return reportedMethodIds;
 }
 
-function createInheritedMethodCompletion(
+export function createUnreportedMethodCompletion(
 	state: Exclude<RunState, 'idle' | 'queued' | 'running'>,
 ): { state: Exclude<RunState, 'idle' | 'queued' | 'running'>; message: string } {
+	const completionState = state === 'errored' ? 'errored' : 'skipped';
+
 	return {
-		state,
-		message: formatRunState(state),
+		state: completionState,
+		message: formatRunState(completionState),
 	};
 }
 
@@ -1371,15 +1465,25 @@ function updateTestRunItem(
 			run.passed(item, durationMs);
 			break;
 		case 'failed':
-			run.failed(item, new vscode.TestMessage(message), durationMs);
+			run.failed(item, createTestRunMessage(message, item), durationMs);
 			break;
 		case 'skipped':
 			run.skipped(item);
 			break;
 		default:
-			run.errored(item, new vscode.TestMessage(message), durationMs);
+			run.errored(item, createTestRunMessage(message, item), durationMs);
 			break;
 	}
+}
+
+function createTestRunMessage(message: string, item: vscode.TestItem): vscode.TestMessage {
+	const testMessage = new vscode.TestMessage(message);
+	if (item.uri && item.range) {
+		testMessage.location = new vscode.Location(item.uri, item.range);
+		testMessage.contextValue = SOURCE_TEST_MESSAGE_CONTEXT;
+	}
+
+	return testMessage;
 }
 
 function formatNodeSummary(summary: RunSummary, state: RunState): string {
@@ -1416,8 +1520,51 @@ function formatRunState(state: RunState): string {
 	}
 }
 
+function createNavigationTargetFromNode(node: DotnetTestNode): NavigationTarget | undefined {
+	return createNavigationTargetFromSourceLocation(node.sourceLocation);
+}
+
+function createNavigationTargetFromSourceLocation(sourceLocation: DiscoveredSourceLocation | undefined): NavigationTarget | undefined {
+	if (!sourceLocation) {
+		return undefined;
+	}
+
+	return {
+		uri: vscode.Uri.file(sourceLocation.filePath),
+		range: new vscode.Range(
+			sourceLocation.range.startLine,
+			sourceLocation.range.startCharacter,
+			sourceLocation.range.endLine,
+			sourceLocation.range.endCharacter,
+		),
+	};
+}
+
+function createNavigationTargetFromLocation(location: vscode.Location | undefined): NavigationTarget | undefined {
+	if (!location) {
+		return undefined;
+	}
+
+	return {
+		uri: location.uri,
+		range: location.range,
+	};
+}
+
+async function openNavigationTarget(target: NavigationTarget): Promise<void> {
+	const document = await vscode.workspace.openTextDocument(target.uri);
+	const editor = await vscode.window.showTextDocument(document, target.range ? { selection: target.range } : {});
+	if (target.range) {
+		editor.revealRange(target.range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+	}
+}
+
 function isNodeLike(value: unknown): value is DotnetTestNode {
 	return typeof value === 'object' && value !== null && 'id' in value && typeof value.id === 'string';
+}
+
+function isTestMessageCommandArgument(value: unknown): value is TestMessageCommandArgument {
+	return typeof value === 'object' && value !== null && ('test' in value || 'message' in value);
 }
 
 function createTestItemDescription(node: DotnetTestNode): string | undefined {
