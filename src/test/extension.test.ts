@@ -9,11 +9,17 @@ import {
 	buildListArguments,
 	buildRunArguments,
 	findNearestSolutionDirectory,
+	parseRunProgressStep,
 	parseDetailedResultLine,
 	parseDetailedResultsFromOutput,
 	parseTrxResultsXml,
 } from '../dotnet';
-import { createUnreportedMethodCompletion, type DotnetTestsApi } from '../extension';
+import {
+	createRunProgressMessage,
+	createRunStartupMessage,
+	createUnreportedMethodCompletion,
+	type DotnetTestsApi,
+} from '../extension';
 import { DotnetTestStore, type DiscoveredProject, type DotnetTestNode, type DotnetTestsSnapshotNode } from '../model';
 
 suite('Extension Test Suite', () => {
@@ -114,6 +120,39 @@ suite('Extension Test Suite', () => {
 				{ name: 'Tests.SampleProject.CalculatorTests.Adds_numbers', state: 'passed' },
 			],
 		);
+	});
+
+	test('formats short run progress messages', () => {
+		assert.strictEqual(
+			createRunStartupMessage('Atlas.Ta.IntegrationTests'),
+			'Starting',
+		);
+		assert.strictEqual(
+			createRunProgressMessage('restore'),
+			'Restoring',
+		);
+		assert.strictEqual(
+			createRunProgressMessage('build'),
+			'Building',
+		);
+		assert.strictEqual(
+			createRunProgressMessage('run'),
+			'Running',
+		);
+		assert.strictEqual(
+			createRunProgressMessage('results'),
+			'Results',
+		);
+	});
+
+	test('parses runner output into progress steps', () => {
+		assert.strictEqual(parseRunProgressStep('Determining projects to restore...'), 'restore');
+		assert.strictEqual(parseRunProgressStep('All projects are up-to-date for restore.'), 'restore');
+		assert.strictEqual(parseRunProgressStep('Atlas.Ta.Domain -> C:\\repo\\bin\\Debug\\Atlas.Ta.Domain.dll'), 'build');
+		assert.strictEqual(parseRunProgressStep('A total of 1 test files matched the specified pattern.'), 'run');
+		assert.strictEqual(parseRunProgressStep('NUnit Adapter 4.6.0.0: Test execution started'), 'run');
+		assert.strictEqual(parseRunProgressStep('NUnit3TestExecutor discovered 1380 of 1384 NUnit test cases using Current Discovery mode, Non-Explicit run'), 'run');
+		assert.strictEqual(parseRunProgressStep('Passed Tests.SampleProject.CalculatorTests.Adds_numbers [12 ms]'), undefined);
 	});
 
 	test('persists and restores the discovery cache', async () => {
@@ -303,6 +342,91 @@ suite('Extension Test Suite', () => {
 					endCharacter: 28,
 				},
 			});
+		} finally {
+			await fs.rm(tempDirectory, { recursive: true, force: true });
+		}
+	});
+
+	test('ignores files removed from project compile items when parsing C# tests', async () => {
+		const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'dotnet-tests-source-'));
+		const projectPath = path.join(tempDirectory, 'Sample.Tests.csproj');
+		const includedFilePath = path.join(tempDirectory, 'IncludedTests.cs');
+		const removedFilePath = path.join(tempDirectory, 'RemovedTests.cs');
+
+		try {
+			await fs.writeFile(projectPath, [
+				'<Project Sdk="Microsoft.NET.Sdk">',
+				'  <ItemGroup>',
+				'    <Compile Remove="RemovedTests.cs" />',
+				'  </ItemGroup>',
+				'</Project>',
+			].join('\n'), 'utf8');
+			await fs.writeFile(includedFilePath, [
+				'namespace Sample.Tests;',
+				'[TestFixture]',
+				'public class IncludedTests',
+				'{',
+				'    [Test]',
+				'    public void Runs() {}',
+				'}',
+			].join('\n'), 'utf8');
+			await fs.writeFile(removedFilePath, [
+				'namespace Sample.Tests;',
+				'[TestFixture]',
+				'public class RemovedTests',
+				'{',
+				'    [Test]',
+				'    public void SkippedByProject() {}',
+				'}',
+			].join('\n'), 'utf8');
+
+			const classes = await parseCSharpTests(projectPath);
+			assert.deepStrictEqual(classes.map(discoveredClass => discoveredClass.label), ['IncludedTests']);
+			assert.deepStrictEqual(classes[0]?.methods.map(method => method.label), ['Runs']);
+		} finally {
+			await fs.rm(tempDirectory, { recursive: true, force: true });
+		}
+	});
+
+	test('respects explicit compile includes when default compile items are disabled', async () => {
+		const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'dotnet-tests-source-'));
+		const projectPath = path.join(tempDirectory, 'Sample.Tests.csproj');
+		const includedFilePath = path.join(tempDirectory, 'IncludedTests.cs');
+		const ignoredFilePath = path.join(tempDirectory, 'IgnoredTests.cs');
+
+		try {
+			await fs.writeFile(projectPath, [
+				'<Project Sdk="Microsoft.NET.Sdk">',
+				'  <PropertyGroup>',
+				'    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>',
+				'  </PropertyGroup>',
+				'  <ItemGroup>',
+				'    <Compile Include="IncludedTests.cs" />',
+				'  </ItemGroup>',
+				'</Project>',
+			].join('\n'), 'utf8');
+			await fs.writeFile(includedFilePath, [
+				'namespace Sample.Tests;',
+				'[TestFixture]',
+				'public class IncludedTests',
+				'{',
+				'    [Test]',
+				'    public void Runs() {}',
+				'}',
+			].join('\n'), 'utf8');
+			await fs.writeFile(ignoredFilePath, [
+				'namespace Sample.Tests;',
+				'[TestFixture]',
+				'public class IgnoredTests',
+				'{',
+				'    [Test]',
+				'    public void NotCompiled() {}',
+				'}',
+			].join('\n'), 'utf8');
+
+			const classes = await parseCSharpTests(projectPath);
+			assert.deepStrictEqual(classes.map(discoveredClass => discoveredClass.label), ['IncludedTests']);
+			assert.deepStrictEqual(classes[0]?.methods.map(method => method.label), ['Runs']);
 		} finally {
 			await fs.rm(tempDirectory, { recursive: true, force: true });
 		}

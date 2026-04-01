@@ -11,9 +11,15 @@ export interface ParseCSharpTestsOptions {
 	fileContents?: ReadonlyMap<string, string>;
 }
 
+interface ProjectCompileSpec {
+	useDefaultCompileItems: boolean;
+	includePatterns: string[];
+	removePatterns: string[];
+}
+
 export async function parseCSharpTests(projectPath: string, options: ParseCSharpTestsOptions = {}): Promise<DiscoveredClass[]> {
-	const projectDirectory = path.dirname(projectPath);
-	const files = await collectCSharpFiles(projectDirectory);
+	const projectText = await fs.readFile(projectPath, 'utf8');
+	const files = await collectProjectCSharpFiles(projectPath, projectText);
 	const classes = new Map<string, DiscoveredClass>();
 	const normalizedFileContents = options.fileContents
 		? new Map([...options.fileContents.entries()].map(([filePath, contents]) => [normalizeFilePath(filePath), contents]))
@@ -93,6 +99,87 @@ export function mergeSourceLocationsIntoListedClasses(
 	}));
 }
 
+async function collectProjectCSharpFiles(projectPath: string, projectText: string): Promise<string[]> {
+	const projectDirectory = path.dirname(projectPath);
+	const compileSpec = parseProjectCompileSpec(projectText);
+	const files = new Map<string, string>();
+
+	if (compileSpec.useDefaultCompileItems) {
+		for (const filePath of await collectCSharpFiles(projectDirectory)) {
+			files.set(normalizeFilePath(filePath), filePath);
+		}
+	}
+
+	for (const filePath of await collectExplicitCompileFiles(projectDirectory, compileSpec.includePatterns)) {
+		files.set(normalizeFilePath(filePath), filePath);
+	}
+
+	return [...files.values()]
+		.filter(filePath => !matchesAnyProjectPattern(normalizeProjectRelativePath(filePath, projectDirectory), compileSpec.removePatterns))
+		.sort((left, right) => left.localeCompare(right));
+}
+
+function parseProjectCompileSpec(projectText: string): ProjectCompileSpec {
+	return {
+		useDefaultCompileItems: readLastBooleanTagValue(projectText, 'EnableDefaultCompileItems') ?? true,
+		includePatterns: readCompileItemPatterns(projectText, 'Include'),
+		removePatterns: readCompileItemPatterns(projectText, 'Remove'),
+	};
+}
+
+function readLastBooleanTagValue(projectText: string, tagName: string): boolean | undefined {
+	const expression = new RegExp(`<${tagName}>\\s*(true|false)\\s*</${tagName}>`, 'gi');
+	let lastValue: boolean | undefined;
+	for (const match of projectText.matchAll(expression)) {
+		lastValue = match[1].toLowerCase() === 'true';
+	}
+
+	return lastValue;
+}
+
+function readCompileItemPatterns(projectText: string, attributeName: 'Include' | 'Remove'): string[] {
+	const expression = new RegExp(`<Compile\\b[^>]*\\b${attributeName}\\s*=\\s*["']([^"']+)["'][^>]*>?(?:\\s*</Compile>)?`, 'gi');
+	const patterns: string[] = [];
+	for (const match of projectText.matchAll(expression)) {
+		patterns.push(...splitProjectItemPatterns(match[1]));
+	}
+
+	return patterns;
+}
+
+function splitProjectItemPatterns(value: string): string[] {
+	return value
+		.split(';')
+		.map(entry => normalizeProjectPattern(entry))
+		.filter(Boolean);
+}
+
+async function collectExplicitCompileFiles(projectDirectory: string, patterns: readonly string[]): Promise<string[]> {
+	const files = new Map<string, string>();
+	for (const pattern of patterns) {
+		for (const filePath of await collectProjectPatternFiles(projectDirectory, pattern)) {
+			files.set(normalizeFilePath(filePath), filePath);
+		}
+	}
+
+	return [...files.values()].sort((left, right) => left.localeCompare(right));
+}
+
+async function collectProjectPatternFiles(projectDirectory: string, pattern: string): Promise<string[]> {
+	if (!hasProjectPatternWildcard(pattern)) {
+		const filePath = path.resolve(projectDirectory, pattern);
+		return await isCSharpFile(filePath) ? [filePath] : [];
+	}
+
+	const searchRoot = getProjectPatternSearchRoot(projectDirectory, pattern);
+	if (!await isDirectory(searchRoot)) {
+		return [];
+	}
+
+	const files = await collectCSharpFiles(searchRoot);
+	return files.filter(filePath => matchesProjectPattern(normalizeProjectRelativePath(filePath, projectDirectory), pattern));
+}
+
 async function collectCSharpFiles(directoryPath: string): Promise<string[]> {
 	const entries = await fs.readdir(directoryPath, { withFileTypes: true });
 	const files: string[] = [];
@@ -114,6 +201,94 @@ async function collectCSharpFiles(directoryPath: string): Promise<string[]> {
 	}
 
 	return files;
+}
+
+async function isDirectory(filePath: string): Promise<boolean> {
+	try {
+		return (await fs.stat(filePath)).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+async function isCSharpFile(filePath: string): Promise<boolean> {
+	if (!filePath.toLowerCase().endsWith('.cs')) {
+		return false;
+	}
+
+	try {
+		return (await fs.stat(filePath)).isFile();
+	} catch {
+		return false;
+	}
+}
+
+function normalizeProjectPattern(pattern: string): string {
+	return pattern.trim().replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
+function hasProjectPatternWildcard(pattern: string): boolean {
+	return /[*?]/.test(pattern);
+}
+
+function getProjectPatternSearchRoot(projectDirectory: string, pattern: string): string {
+	const literalSegments: string[] = [];
+	for (const segment of pattern.split('/')) {
+		if (segment === '**' || /[*?]/.test(segment)) {
+			break;
+		}
+
+		literalSegments.push(segment);
+	}
+
+	return path.resolve(projectDirectory, ...literalSegments);
+}
+
+function normalizeProjectRelativePath(filePath: string, projectDirectory: string): string {
+	return path.relative(projectDirectory, filePath).replace(/\\/g, '/');
+}
+
+function matchesAnyProjectPattern(filePath: string, patterns: readonly string[]): boolean {
+	return patterns.some(pattern => matchesProjectPattern(filePath, pattern));
+}
+
+function matchesProjectPattern(filePath: string, pattern: string): boolean {
+	return createProjectPatternRegExp(pattern).test(filePath);
+}
+
+function createProjectPatternRegExp(pattern: string): RegExp {
+	let expression = '^';
+	for (let index = 0; index < pattern.length; index += 1) {
+		const character = pattern[index];
+		if (character === '*') {
+			if (pattern[index + 1] === '*') {
+				if (pattern[index + 2] === '/') {
+					expression += '(?:[^/]+/)*';
+					index += 2;
+				} else {
+					expression += '.*';
+					index += 1;
+				}
+			} else {
+				expression += '[^/]*';
+			}
+			continue;
+		}
+
+		if (character === '?') {
+			expression += '[^/]';
+			continue;
+		}
+
+		expression += escapeRegExpCharacter(character);
+	}
+
+	expression += '$';
+	return new RegExp(expression, 'i');
+}
+
+function escapeRegExpCharacter(character: string): string {
+	return /[|\\{}()[\]^$+?.]/.test(character) ? `\\${character}` : character;
 }
 
 function parseClassesFromSource(source: string, filePath: string): ParsedClass[] {

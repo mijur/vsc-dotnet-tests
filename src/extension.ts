@@ -9,6 +9,7 @@ import {
 	runDotnetTarget as executeDotnetTarget,
 	type DetailedTestResult,
 	type DotnetCommandResult,
+	type RunProgressStep,
 	type RunDotnetTargetOptions,
 } from './dotnet';
 import { DotnetTestStore, formatRunnerMode, type DiscoveredProject, type DiscoveredSourceLocation, type DotnetTestNode, type DotnetTestsSnapshotNode, type MethodNode, type NodeStateUpdate, type ProjectNode, type RunSummary, type RunState } from './model';
@@ -508,9 +509,15 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 		run: vscode.TestRun,
 		token?: vscode.CancellationToken,
 	): Promise<DotnetCommandResult> {
+		const progressReporter = this.createRunProgressReporter(run);
+		progressReporter.reportStep('starting');
 		const runOptions: RunDotnetTargetOptions = {
 			token,
-			onTestResult: testResult => this.applyLiveMethodResult(tracker, testResult, run),
+			onProgress: step => progressReporter.reportStep(step),
+			onTestResult: testResult => {
+				progressReporter.reportStep('results');
+				this.applyLiveMethodResult(tracker, testResult, run);
+			},
 		};
 
 		return executeDotnetTarget(
@@ -518,6 +525,21 @@ class DotnetTestsExtension implements vscode.Disposable, DotnetTestsApi {
 			this.output,
 			runOptions as RunDotnetTargetOptions & vscode.CancellationToken,
 		);
+	}
+
+	private createRunProgressReporter(run: vscode.TestRun): RunProgressReporter {
+		let lastReportedStepOrder = -1;
+		return {
+			reportStep(step: RunProgressMessageStep): void {
+				const stepOrder = getRunProgressStepOrder(step);
+				if (stepOrder <= lastReportedStepOrder) {
+					return;
+				}
+
+				lastReportedStepOrder = stepOrder;
+				run.appendOutput(`${createRunProgressMessage(step)}\r\n`);
+			},
+		};
 	}
 
 	private startTargetRunState(
@@ -1186,6 +1208,12 @@ interface LiveMethodRunTracker {
 	startedMethodIds: Set<string>;
 }
 
+type RunProgressMessageStep = RunProgressStep | 'starting' | 'results';
+
+interface RunProgressReporter {
+	reportStep(step: RunProgressMessageStep): void;
+}
+
 function createAggregateSummary(label: string, nodes: readonly DotnetTestNode[]): RunSummary {
 	return {
 		label,
@@ -1484,6 +1512,40 @@ function createTestRunMessage(message: string, item: vscode.TestItem): vscode.Te
 	}
 
 	return testMessage;
+}
+
+export function createRunStartupMessage(label: string): string {
+	return 'Starting';
+}
+
+export function createRunProgressMessage(step: RunProgressMessageStep): string {
+	switch (step) {
+		case 'starting':
+			return createRunStartupMessage('');
+		case 'restore':
+			return 'Restoring';
+		case 'build':
+			return 'Building';
+		case 'run':
+			return 'Running';
+		case 'results':
+			return 'Results';
+	}
+}
+
+function getRunProgressStepOrder(step: RunProgressMessageStep): number {
+	switch (step) {
+		case 'starting':
+			return 0;
+		case 'restore':
+			return 1;
+		case 'build':
+			return 2;
+		case 'run':
+			return 3;
+		case 'results':
+			return 4;
+	}
 }
 
 function formatNodeSummary(summary: RunSummary, state: RunState): string {

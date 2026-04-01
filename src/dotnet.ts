@@ -33,6 +33,7 @@ const XUNIT_MTP_PACKAGE_PATTERNS = [
 ];
 
 type CompletedRunState = Exclude<RunState, 'idle' | 'queued' | 'running'>;
+export type RunProgressStep = 'restore' | 'build' | 'run';
 
 export interface DetailedTestResult {
 	name: string;
@@ -64,6 +65,7 @@ export interface RunArgumentOptions {
 export interface RunDotnetTargetOptions {
 	token?: vscode.CancellationToken;
 	onTestResult?: (result: DetailedTestResult) => void;
+	onProgress?: (step: RunProgressStep) => void;
 }
 
 interface ExecuteDotnetOptions extends RunDotnetTargetOptions {}
@@ -595,7 +597,10 @@ async function executeDotnet(
 		let cancelled = false;
 		let stdoutBuffer = '';
 		let stderrBuffer = '';
+		let stdoutProgressBuffer = '';
+		let stderrProgressBuffer = '';
 		const seenDetailedResults = new Set<string>();
+		const seenProgressSteps = new Set<RunProgressStep>();
 
 		const cancellationSubscription = options.token?.onCancellationRequested(() => {
 			cancelled = true;
@@ -607,6 +612,7 @@ async function executeDotnet(
 			stdout += text;
 			output.append(text);
 			stdoutBuffer = processDetailedResultText(stdoutBuffer, text, seenDetailedResults, options.onTestResult);
+			stdoutProgressBuffer = processRunProgressText(stdoutProgressBuffer, text, seenProgressSteps, options.onProgress);
 		});
 
 		child.stderr.on('data', chunk => {
@@ -614,6 +620,7 @@ async function executeDotnet(
 			stderr += text;
 			output.append(text);
 			stderrBuffer = processDetailedResultText(stderrBuffer, text, seenDetailedResults, options.onTestResult);
+			stderrProgressBuffer = processRunProgressText(stderrProgressBuffer, text, seenProgressSteps, options.onProgress);
 		});
 
 		child.on('error', error => {
@@ -635,6 +642,8 @@ async function executeDotnet(
 
 			flushDetailedResultBuffer(stdoutBuffer, seenDetailedResults, options.onTestResult);
 			flushDetailedResultBuffer(stderrBuffer, seenDetailedResults, options.onTestResult);
+			flushRunProgressBuffer(stdoutProgressBuffer, seenProgressSteps, options.onProgress);
+			flushRunProgressBuffer(stderrProgressBuffer, seenProgressSteps, options.onProgress);
 
 			resolve({
 				exitCode: code ?? 1,
@@ -879,6 +888,74 @@ function createDetailedResultKey(result: DetailedTestResult): string {
 
 function createObservedDetailedResultKey(result: DetailedTestResult): string {
 	return `${result.state}:${normalizeReportedName(result.fullyQualifiedName ?? result.name)}`;
+}
+
+function processRunProgressText(
+	buffer: string,
+	text: string,
+	seenProgressSteps: Set<RunProgressStep>,
+	onProgress?: (step: RunProgressStep) => void,
+): string {
+	const combined = buffer + text;
+	const lines = combined.split(/\r?\n/);
+	const remainder = lines.pop() ?? '';
+
+	for (const line of lines) {
+		emitRunProgressLine(line, seenProgressSteps, onProgress);
+	}
+
+	return remainder;
+}
+
+function flushRunProgressBuffer(
+	buffer: string,
+	seenProgressSteps: Set<RunProgressStep>,
+	onProgress?: (step: RunProgressStep) => void,
+): void {
+	if (!buffer.trim()) {
+		return;
+	}
+
+	emitRunProgressLine(buffer, seenProgressSteps, onProgress);
+}
+
+function emitRunProgressLine(
+	line: string,
+	seenProgressSteps: Set<RunProgressStep>,
+	onProgress?: (step: RunProgressStep) => void,
+): void {
+	const step = parseRunProgressStep(line);
+	if (!step || seenProgressSteps.has(step)) {
+		return;
+	}
+
+	seenProgressSteps.add(step);
+	onProgress?.(step);
+}
+
+export function parseRunProgressStep(line: string): RunProgressStep | undefined {
+	const candidate = stripAnsi(line).trim();
+	if (!candidate) {
+		return undefined;
+	}
+
+	if (/^(Determining projects to restore|Restore complete|Restored\b|All projects are up-to-date)/i.test(candidate)) {
+		return 'restore';
+	}
+
+	if (/^.+\s->\s.+\.(?:dll|exe)$/i.test(candidate)) {
+		return 'build';
+	}
+
+	if (
+		/^(A total of \d+ test files matched the specified pattern\.?|Starting test execution|Running tests from|Running all tests in|The following Tests are available:)/i.test(candidate)
+		|| /NUnit Adapter .*: Test execution started/i.test(candidate)
+		|| /discovered \d+ of \d+ .*test cases/i.test(candidate)
+	) {
+		return 'run';
+	}
+
+	return undefined;
 }
 
 function processDetailedResultText(
